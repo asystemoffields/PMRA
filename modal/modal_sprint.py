@@ -1159,6 +1159,73 @@ def run_production_mix_configured_job(job: dict) -> dict:
 @app.function(
     image=image,
     volumes={"/cache": cache_volume},
+    gpu="A100",
+    timeout=60 * 60 * 4,
+)
+def run_olmo_reverse_frontier_job(
+    model_key: str,
+    result_bucket: str,
+    seed: int = 7,
+    eval_prompts: int = 96,
+    calib_prompts: int = 24,
+    eval_max_length: int = 128,
+    calib_max_length: int = 128,
+    sweep_payload_bpws: str = "3.60,3.65,3.70",
+    max_shrink_nll_loss: float = 0.03,
+) -> dict:
+    """Detached-friendly single-model OLMo reverse-demotion frontier run."""
+    group_mode = "layer_family"
+    low_source = "iq2_m"
+    target_source = "iq3_xs"
+    high_sources = "iq4_xs"
+    candidate_variant = "c2_reverse_greedy_bpw_3p650_mixed"
+    demotion_sources = "iq3_xxs,iq2_xs,iq2_m,q2_k"
+    candidate_suffix = _candidate_suffix(candidate_variant)
+    frontier_suffix = (
+        f"_sweep_{sweep_payload_bpws.replace(',', '_').replace('.', 'p')}"
+        f"_demote_{demotion_sources.replace(',', '_')}"
+    )
+    job = {
+        "name": (
+            f"{model_key}_c2_publiccal_wikitext_wikitext-2-raw-v1_"
+            f"train_to_validation_low_{low_source}_target_{target_source}_"
+            f"high_{high_sources.replace(',', '_')}_seed_{seed}_eval_{eval_prompts}_"
+            f"calib_{calib_prompts}_{group_mode}_len_{eval_max_length}"
+            f"{candidate_suffix}{frontier_suffix}"
+        ),
+        "model_key": model_key,
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS[model_key]["layers"],
+        "group_mode": group_mode,
+        "low_source": low_source,
+        "target_source": target_source,
+        "high_sources": high_sources,
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": candidate_variant,
+        "knapsack_max_states": 50000,
+        "sweep_payload_bpws": sweep_payload_bpws,
+        "sweep_selectors": "calib_knapsack",
+        "demotion_sources": demotion_sources,
+        "demotion_base_source": target_source,
+        "demotion_selectors": "reverse_knapsack,reverse_greedy",
+        "max_shrink_nll_loss": max_shrink_nll_loss,
+        "result_bucket": result_bucket,
+    }
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
     timeout=60 * 60,
 )
 def run_c2_artifact_job(job: dict) -> dict:
