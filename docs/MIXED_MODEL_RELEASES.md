@@ -4,6 +4,9 @@ This is the chronological PMRA release list, newest to oldest. The README
 describes the method; this file records released mixes, source checkpoints, and
 where to find their reports.
 
+Public GGUF mixes are also grouped in the Hugging Face
+[PMRA collection](https://huggingface.co/collections/Asystemoffields/pmra-6a1067359be8a5f82021efe5).
+
 ## Granite 4.1 8B Heretic
 
 - release repo:
@@ -18,6 +21,8 @@ where to find their reports.
 
 ## Ministral 3 8B Instruct
 
+- release repo:
+  `https://huggingface.co/Asystemoffields/Ministral-3-8B-Instruct-PMRA-GGUF`
 - release mixes:
   `ministral3_8b_pmra_knapsack_iq3xs_budget.gguf`,
   `ministral3_8b_pmra_knapsack_3p2.gguf`
@@ -63,4 +68,3 @@ where to find their reports.
 - target/control budget: `IQ3_XS`
 - model card source: [Qwen3 1.7B HF Model Card](HF_MODEL_CARD.md)
 - broader evidence: [Evidence Ledger](EVIDENCE.md)
-

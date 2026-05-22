@@ -13,7 +13,8 @@ selection-and-materialization method over production GGUF payloads. Each mix
 records its source allocation in `pmra.*` metadata and in the artifact report.
 
 Released model mixes, metrics, and upstream attribution are tracked separately
-from this method overview.
+from this method overview. The Hugging Face collection for public PMRA GGUF
+mixes is [PMRA](https://huggingface.co/collections/Asystemoffields/pmra-6a1067359be8a5f82021efe5).
 
 ## Vocabulary
 
