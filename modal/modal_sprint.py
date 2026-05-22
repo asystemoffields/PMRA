@@ -958,6 +958,36 @@ def run_production_mix_job(job: dict) -> dict:
         cmd.extend(["--sweep-payload-bpws", job["sweep_payload_bpws"]])
     if job.get("sweep_selectors", ""):
         cmd.extend(["--sweep-selectors", job["sweep_selectors"]])
+    if job.get("local_search_from", ""):
+        cmd.extend(["--local-search-from", job["local_search_from"]])
+    if int(job.get("local_search_steps", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--local-search-steps",
+                str(job["local_search_steps"]),
+                "--local-search-candidates",
+                str(job.get("local_search_candidates", 24)),
+                "--local-search-min-improvement",
+                str(job.get("local_search_min_improvement", 0.0001)),
+            ]
+        )
+    if job.get("genetic_search_from", ""):
+        cmd.extend(["--genetic-search-from", job["genetic_search_from"]])
+    if int(job.get("genetic_search_generations", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--genetic-search-generations",
+                str(job["genetic_search_generations"]),
+                "--genetic-search-population",
+                str(job.get("genetic_search_population", 8)),
+                "--genetic-search-elite",
+                str(job.get("genetic_search_elite", 2)),
+                "--genetic-search-mutation-rate",
+                str(job.get("genetic_search_mutation_rate", 0.25)),
+            ]
+        )
+    if bool(job.get("genetic_search_direct", False)):
+        cmd.append("--genetic-search-direct")
     if demotion_sources:
         cmd.extend(["--demotion-sources", demotion_sources])
     if job.get("demotion_base_source"):
@@ -1058,6 +1088,36 @@ def run_production_mix_configured_job(job: dict) -> dict:
         cmd.extend(["--sweep-payload-bpws", job["sweep_payload_bpws"]])
     if job.get("sweep_selectors", ""):
         cmd.extend(["--sweep-selectors", job["sweep_selectors"]])
+    if job.get("local_search_from", ""):
+        cmd.extend(["--local-search-from", job["local_search_from"]])
+    if int(job.get("local_search_steps", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--local-search-steps",
+                str(job["local_search_steps"]),
+                "--local-search-candidates",
+                str(job.get("local_search_candidates", 24)),
+                "--local-search-min-improvement",
+                str(job.get("local_search_min_improvement", 0.0001)),
+            ]
+        )
+    if job.get("genetic_search_from", ""):
+        cmd.extend(["--genetic-search-from", job["genetic_search_from"]])
+    if int(job.get("genetic_search_generations", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--genetic-search-generations",
+                str(job["genetic_search_generations"]),
+                "--genetic-search-population",
+                str(job.get("genetic_search_population", 8)),
+                "--genetic-search-elite",
+                str(job.get("genetic_search_elite", 2)),
+                "--genetic-search-mutation-rate",
+                str(job.get("genetic_search_mutation_rate", 0.25)),
+            ]
+        )
+    if bool(job.get("genetic_search_direct", False)):
+        cmd.append("--genetic-search-direct")
     if demotion_sources:
         cmd.extend(["--demotion-sources", demotion_sources])
     if job.get("demotion_base_source"):
@@ -1620,6 +1680,16 @@ def phase_c2_mix(
     high_sources: str = "q3_k_m,iq4_xs",
     candidate_variant: str = "c2_calib_greedy_mixed",
     knapsack_max_states: int = 50000,
+    local_search_from: str = "",
+    local_search_steps: int = 0,
+    local_search_candidates: int = 24,
+    local_search_min_improvement: float = 0.0001,
+    genetic_search_from: str = "",
+    genetic_search_generations: int = 0,
+    genetic_search_population: int = 8,
+    genetic_search_elite: int = 2,
+    genetic_search_mutation_rate: float = 0.25,
+    genetic_search_direct: bool = False,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1634,6 +1704,12 @@ def phase_c2_mix(
     frontier_suffix = ""
     if sweep_payload_bpws:
         frontier_suffix += f"_sweep_{sweep_payload_bpws.replace(',', '_').replace('.', 'p')}"
+    if local_search_steps:
+        frontier_suffix += f"_local_{local_search_steps}x{local_search_candidates}"
+    if genetic_search_generations:
+        frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
+        if genetic_search_direct:
+            frontier_suffix += "_direct"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1652,6 +1728,16 @@ def phase_c2_mix(
             "high_sources": high_sources,
             "candidate_variant": candidate_variant,
             "knapsack_max_states": knapsack_max_states,
+            "local_search_from": local_search_from,
+            "local_search_steps": local_search_steps,
+            "local_search_candidates": local_search_candidates,
+            "local_search_min_improvement": local_search_min_improvement,
+            "genetic_search_from": genetic_search_from,
+            "genetic_search_generations": genetic_search_generations,
+            "genetic_search_population": genetic_search_population,
+            "genetic_search_elite": genetic_search_elite,
+            "genetic_search_mutation_rate": genetic_search_mutation_rate,
+            "genetic_search_direct": genetic_search_direct,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1679,6 +1765,16 @@ def phase_c2_replicate(
     high_sources: str = "q3_k_m,iq4_xs",
     candidate_variant: str = "c2_calib_greedy_mixed",
     knapsack_max_states: int = 50000,
+    local_search_from: str = "",
+    local_search_steps: int = 0,
+    local_search_candidates: int = 24,
+    local_search_min_improvement: float = 0.0001,
+    genetic_search_from: str = "",
+    genetic_search_generations: int = 0,
+    genetic_search_population: int = 8,
+    genetic_search_elite: int = 2,
+    genetic_search_mutation_rate: float = 0.25,
+    genetic_search_direct: bool = False,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1693,6 +1789,12 @@ def phase_c2_replicate(
     frontier_suffix = ""
     if sweep_payload_bpws:
         frontier_suffix += f"_sweep_{sweep_payload_bpws.replace(',', '_').replace('.', 'p')}"
+    if local_search_steps:
+        frontier_suffix += f"_local_{local_search_steps}x{local_search_candidates}"
+    if genetic_search_generations:
+        frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
+        if genetic_search_direct:
+            frontier_suffix += "_direct"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1713,6 +1815,16 @@ def phase_c2_replicate(
             "high_sources": high_sources,
             "candidate_variant": candidate_variant,
             "knapsack_max_states": knapsack_max_states,
+            "local_search_from": local_search_from,
+            "local_search_steps": local_search_steps,
+            "local_search_candidates": local_search_candidates,
+            "local_search_min_improvement": local_search_min_improvement,
+            "genetic_search_from": genetic_search_from,
+            "genetic_search_generations": genetic_search_generations,
+            "genetic_search_population": genetic_search_population,
+            "genetic_search_elite": genetic_search_elite,
+            "genetic_search_mutation_rate": genetic_search_mutation_rate,
+            "genetic_search_direct": genetic_search_direct,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1787,6 +1899,16 @@ def phase_c2_public_calibrated(
     prompt_seed: int = 2701,
     candidate_variant: str = "c2_calib_greedy_mixed",
     knapsack_max_states: int = 50000,
+    local_search_from: str = "",
+    local_search_steps: int = 0,
+    local_search_candidates: int = 24,
+    local_search_min_improvement: float = 0.0001,
+    genetic_search_from: str = "",
+    genetic_search_generations: int = 0,
+    genetic_search_population: int = 8,
+    genetic_search_elite: int = 2,
+    genetic_search_mutation_rate: float = 0.25,
+    genetic_search_direct: bool = False,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1801,6 +1923,12 @@ def phase_c2_public_calibrated(
     frontier_suffix = ""
     if sweep_payload_bpws:
         frontier_suffix += f"_sweep_{sweep_payload_bpws.replace(',', '_').replace('.', 'p')}"
+    if local_search_steps:
+        frontier_suffix += f"_local_{local_search_steps}x{local_search_candidates}"
+    if genetic_search_generations:
+        frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
+        if genetic_search_direct:
+            frontier_suffix += "_direct"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = []
@@ -1833,6 +1961,16 @@ def phase_c2_public_calibrated(
                 "prompt_seed": prompt_seed,
                 "candidate_variant": candidate_variant,
                 "knapsack_max_states": knapsack_max_states,
+                "local_search_from": local_search_from,
+                "local_search_steps": local_search_steps,
+                "local_search_candidates": local_search_candidates,
+                "local_search_min_improvement": local_search_min_improvement,
+                "genetic_search_from": genetic_search_from,
+                "genetic_search_generations": genetic_search_generations,
+                "genetic_search_population": genetic_search_population,
+                "genetic_search_elite": genetic_search_elite,
+                "genetic_search_mutation_rate": genetic_search_mutation_rate,
+                "genetic_search_direct": genetic_search_direct,
                 "sweep_payload_bpws": sweep_payload_bpws,
                 "sweep_selectors": sweep_selectors,
                 "demotion_sources": demotion_sources,

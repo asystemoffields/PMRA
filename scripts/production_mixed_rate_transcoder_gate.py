@@ -692,6 +692,38 @@ def group_weight_sse_delta(hf, model, readers: dict[str, dict], groups: dict[str
     return low_sse - high_sse
 
 
+def build_direct_promotion_rows(
+    readers: dict[str, dict],
+    groups: dict[str, list[TensorSpec]],
+    low_source: str,
+    high_sources: list[str],
+) -> list[dict]:
+    rows: list[dict] = []
+    for group in groups:
+        low_bytes = group_payload_bytes(readers, groups, group, low_source)
+        for source in high_sources:
+            high_bytes = group_payload_bytes(readers, groups, group, source)
+            extra = high_bytes - low_bytes
+            if extra <= 0:
+                continue
+            rows.append(
+                {
+                    "group": group,
+                    "source": source,
+                    "low_bytes": int(low_bytes),
+                    "high_bytes": int(high_bytes),
+                    "extra_bytes": int(extra),
+                    "calib_nll": None,
+                    "calib_nll_improvement": 1.0,
+                    "calib_score_per_mbyte": float(1.0 / (extra / 1_000_000)),
+                    "weight_sse_delta": 0.0,
+                    "weight_score_per_mbyte": 0.0,
+                    "direct_search_only": True,
+                }
+            )
+    return rows
+
+
 def select_by_score(rows: list[dict], budget_extra: int, score_key: str) -> list[dict]:
     selected: list[dict] = []
     seen_groups: set[str] = set()
@@ -899,6 +931,594 @@ def bpw_tag(value: float) -> str:
 
 def sweep_variant_name(selector: str, payload_bpw: float) -> str:
     return f"{promotion_selector_variant_prefix(selector)}_bpw_{bpw_tag(payload_bpw)}_mixed"
+
+
+def local_search_variant_name(base_variant: str) -> str:
+    if base_variant.endswith("_mixed"):
+        return f"{base_variant[:-len('_mixed')]}_local_mixed"
+    return f"{base_variant}_local"
+
+
+def genetic_variant_name(base_variant: str) -> str:
+    if base_variant.endswith("_mixed"):
+        return f"{base_variant[:-len('_mixed')]}_genetic_mixed"
+    return f"{base_variant}_genetic"
+
+
+def infer_local_search_base_variant(candidate_variant: str) -> str:
+    if candidate_variant.endswith("_local_mixed"):
+        return f"{candidate_variant[:-len('_local_mixed')]}_mixed"
+    return "c2_calib_knapsack_mixed"
+
+
+def infer_genetic_search_base_variant(candidate_variant: str) -> str:
+    if candidate_variant.endswith("_genetic_mixed"):
+        return f"{candidate_variant[:-len('_genetic_mixed')]}_mixed"
+    return "c2_calib_knapsack_mixed"
+
+
+def selection_signature(selected: list[dict]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((str(row["group"]), str(row["source"])) for row in selected))
+
+
+def selection_by_group(selected: list[dict]) -> dict[str, dict]:
+    return {str(row["group"]): row for row in selected}
+
+
+def selection_from_group_map(group_map: dict[str, dict]) -> list[dict]:
+    return [group_map[group] for group in sorted(group_map)]
+
+
+def local_search_neighbor_candidates(
+    rows: list[dict],
+    current: list[dict],
+    budget_extra: int,
+    max_candidates: int,
+) -> list[dict]:
+    max_candidates = max(1, int(max_candidates))
+    current_by_group = selection_by_group(current)
+    current_extra = selected_extra_bytes(current)
+    current_sig = selection_signature(current)
+    selected_groups = set(current_by_group)
+    selected_rows = list(current_by_group.values())
+    eligible = [
+        row
+        for row in rows
+        if int(row.get("extra_bytes", 0)) > 0 and float(row.get("calib_nll_improvement", 0.0)) > 0.0
+    ]
+    value = lambda row: float(row.get("calib_nll_improvement", 0.0))
+    seen: set[tuple[tuple[str, str], ...]] = {current_sig}
+    candidates: list[dict] = []
+
+    def add_candidate(kind: str, desc: str, group_map: dict[str, dict], proxy_delta: float) -> None:
+        selected = selection_from_group_map(group_map)
+        sig = selection_signature(selected)
+        if sig in seen:
+            return
+        seen.add(sig)
+        extra = selected_extra_bytes(selected)
+        if extra > budget_extra:
+            return
+        candidates.append(
+            {
+                "kind": kind,
+                "move": desc,
+                "proxy_delta": float(proxy_delta),
+                "selected": selected,
+                "extra_bytes": int(extra),
+            }
+        )
+
+    add_pool = sorted(
+        [row for row in eligible if str(row["group"]) not in selected_groups],
+        key=lambda row: (value(row), -int(row["extra_bytes"]), str(row["group"]), str(row["source"])),
+        reverse=True,
+    )[: max_candidates * 3]
+    replace_pool = sorted(
+        [row for row in eligible if str(row["group"]) in selected_groups],
+        key=lambda row: (value(row), -int(row["extra_bytes"]), str(row["group"]), str(row["source"])),
+        reverse=True,
+    )[: max_candidates * 3]
+    remove_pool = sorted(
+        selected_rows,
+        key=lambda row: (value(row), -int(row["extra_bytes"]), str(row["group"]), str(row["source"])),
+    )[: max(4, max_candidates)]
+
+    for row in add_pool:
+        group = str(row["group"])
+        if current_extra + int(row["extra_bytes"]) > budget_extra:
+            continue
+        group_map = dict(current_by_group)
+        group_map[group] = row
+        add_candidate("add", f"add {group}->{row['source']}", group_map, value(row))
+
+    for row in replace_pool:
+        group = str(row["group"])
+        old = current_by_group[group]
+        if str(old["source"]) == str(row["source"]):
+            continue
+        new_extra = current_extra - int(old["extra_bytes"]) + int(row["extra_bytes"])
+        if new_extra > budget_extra:
+            continue
+        group_map = dict(current_by_group)
+        group_map[group] = row
+        add_candidate(
+            "replace",
+            f"replace {group}: {old['source']}->{row['source']}",
+            group_map,
+            value(row) - value(old),
+        )
+
+    for old in remove_pool:
+        group = str(old["group"])
+        group_map = dict(current_by_group)
+        del group_map[group]
+        add_candidate("drop", f"drop {group}->{old['source']}", group_map, -value(old))
+
+    for old in remove_pool:
+        old_group = str(old["group"])
+        for row in add_pool:
+            new_group = str(row["group"])
+            if new_group == old_group:
+                continue
+            new_extra = current_extra - int(old["extra_bytes"]) + int(row["extra_bytes"])
+            if new_extra > budget_extra:
+                continue
+            group_map = dict(current_by_group)
+            del group_map[old_group]
+            group_map[new_group] = row
+            add_candidate(
+                "swap",
+                f"swap {old_group}->{old['source']} for {new_group}->{row['source']}",
+                group_map,
+                value(row) - value(old),
+            )
+
+    candidates.sort(key=lambda item: (item["proxy_delta"], item["extra_bytes"]), reverse=True)
+    return candidates[:max_candidates]
+
+
+def evaluate_selection_nll(
+    model,
+    tokenizer,
+    hf,
+    readers: dict[str, dict],
+    groups: dict[str, list[TensorSpec]],
+    args,
+    base_source: str,
+    selected: list[dict],
+    prompts: list[str],
+    max_length: int,
+) -> dict:
+    patch_all_from_source(model, hf, readers, args.layers, base_source, args.group_mode, args.tensor_profile)
+    apply_selection(model, hf, readers, groups, selected)
+    return evaluate_nll(model, tokenizer, prompts, max_length)
+
+
+def local_search_repair_selection(
+    model,
+    tokenizer,
+    hf,
+    readers: dict[str, dict],
+    groups: dict[str, list[TensorSpec]],
+    args,
+    rows: list[dict],
+    start_selected: list[dict],
+    base_source: str,
+    budget_extra: int,
+    local_search_prompts: list[str],
+) -> tuple[list[dict], dict]:
+    if selected_saved_bytes(start_selected) > 0:
+        raise ValueError("local search currently supports promotion selections only")
+
+    current = list(start_selected)
+    current_eval = evaluate_selection_nll(
+        model,
+        tokenizer,
+        hf,
+        readers,
+        groups,
+        args,
+        base_source,
+        current,
+        prompts=local_search_prompts,
+        max_length=args.calib_max_length,
+    )
+    current_nll = float(current_eval["nll"])
+    start_nll = current_nll
+    accepted: list[dict] = []
+    rejected_best: list[dict] = []
+    evaluated_moves = 0
+    min_improvement = float(args.local_search_min_improvement)
+
+    print(
+        f"[c2] local search start nll={current_nll:.6f} groups={len(current)} extra={selected_extra_bytes(current)}",
+        flush=True,
+    )
+
+    for step in range(1, int(args.local_search_steps) + 1):
+        candidates = local_search_neighbor_candidates(
+            rows,
+            current,
+            budget_extra,
+            int(args.local_search_candidates),
+        )
+        if not candidates:
+            break
+
+        best: dict | None = None
+        best_improvement = float("-inf")
+        for candidate_idx, candidate in enumerate(candidates, start=1):
+            evaluated_moves += 1
+            print(
+                f"[c2] local search step {step} evaluating "
+                f"{candidate_idx}/{len(candidates)}: {candidate['move']}",
+                flush=True,
+            )
+            cand_eval = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                candidate["selected"],
+                prompts=local_search_prompts,
+                max_length=args.calib_max_length,
+            )
+            cand_nll = float(cand_eval["nll"])
+            improvement = current_nll - cand_nll
+            if improvement > best_improvement:
+                best_improvement = improvement
+                best = {
+                    "step": step,
+                    "move": candidate["move"],
+                    "kind": candidate["kind"],
+                    "proxy_delta": float(candidate["proxy_delta"]),
+                    "nll": cand_nll,
+                    "nll_improvement": float(improvement),
+                    "extra_bytes": int(candidate["extra_bytes"]),
+                    "selected": candidate["selected"],
+                }
+
+        if best is None:
+            break
+        print(
+            f"[c2] local search step {step} best {best['move']} "
+            f"nll={best['nll']:.6f} improvement={best['nll_improvement']:.6f}",
+            flush=True,
+        )
+        if best["nll_improvement"] < min_improvement:
+            rejected_best.append({k: v for k, v in best.items() if k != "selected"})
+            break
+        current = list(best["selected"])
+        current_nll = float(best["nll"])
+        accepted.append({k: v for k, v in best.items() if k != "selected"})
+
+    report = {
+        "start_nll": float(start_nll),
+        "final_nll": float(current_nll),
+        "total_nll_improvement": float(start_nll - current_nll),
+        "steps_requested": int(args.local_search_steps),
+        "candidate_limit": int(args.local_search_candidates),
+        "min_improvement": float(min_improvement),
+        "evaluated_moves": int(evaluated_moves),
+        "accepted_moves": accepted,
+        "rejected_best_moves": rejected_best,
+    }
+    return current, report
+
+
+def repair_selection_to_budget(
+    selected: list[dict],
+    budget_extra: int,
+    value_key: str = "calib_nll_improvement",
+) -> list[dict]:
+    group_map = selection_by_group(selected)
+    while selected_extra_bytes(list(group_map.values())) > budget_extra and group_map:
+        worst_group = min(
+            group_map,
+            key=lambda group: (
+                float(group_map[group].get(value_key, 0.0)) / max(1, int(group_map[group].get("extra_bytes", 0))),
+                float(group_map[group].get(value_key, 0.0)),
+            ),
+        )
+        del group_map[worst_group]
+    return selection_from_group_map(group_map)
+
+
+def random_promotion_selection(rows: list[dict], budget_extra: int, rng: random.Random) -> list[dict]:
+    eligible_by_group: dict[str, list[dict]] = {}
+    direct_mode = any(bool(row.get("direct_search_only", False)) for row in rows)
+    for row in rows:
+        if int(row.get("extra_bytes", 0)) <= 0 or float(row.get("calib_nll_improvement", 0.0)) <= 0.0:
+            continue
+        if int(row["extra_bytes"]) > budget_extra:
+            continue
+        eligible_by_group.setdefault(str(row["group"]), []).append(row)
+    for group_rows in eligible_by_group.values():
+        group_rows.sort(
+            key=lambda row: (
+                float(row.get("calib_nll_improvement", 0.0)),
+                -int(row.get("extra_bytes", 0)),
+                str(row.get("source", "")),
+            ),
+            reverse=True,
+        )
+
+    selected: list[dict] = []
+    used = 0
+    groups = list(eligible_by_group)
+    rng.shuffle(groups)
+    for group in groups:
+        choices = eligible_by_group[group]
+        if direct_mode:
+            row = rng.choice(choices)
+        else:
+            row = rng.choice(choices[: min(4, len(choices))])
+        extra = int(row["extra_bytes"])
+        if used + extra > budget_extra:
+            continue
+        selected.append(row)
+        used += extra
+    return selected
+
+
+def crossover_selections(
+    parent_a: list[dict],
+    parent_b: list[dict],
+    budget_extra: int,
+    rng: random.Random,
+) -> list[dict]:
+    a_by_group = selection_by_group(parent_a)
+    b_by_group = selection_by_group(parent_b)
+    child: dict[str, dict] = {}
+    for group in sorted(set(a_by_group) | set(b_by_group)):
+        options = [row for row in (a_by_group.get(group), b_by_group.get(group)) if row is not None]
+        if not options:
+            continue
+        if len(options) == 1:
+            chosen = options[0]
+        else:
+            chosen = rng.choice(options)
+        child[group] = chosen
+    return repair_selection_to_budget(selection_from_group_map(child), budget_extra)
+
+
+def mutate_selection(
+    rows: list[dict],
+    selected: list[dict],
+    budget_extra: int,
+    rng: random.Random,
+    mutation_rate: float,
+) -> list[dict]:
+    eligible = [
+        row
+        for row in rows
+        if int(row.get("extra_bytes", 0)) > 0
+        and float(row.get("calib_nll_improvement", 0.0)) > 0.0
+        and int(row["extra_bytes"]) <= budget_extra
+    ]
+    if not eligible:
+        return selected
+    by_group: dict[str, list[dict]] = {}
+    for row in eligible:
+        by_group.setdefault(str(row["group"]), []).append(row)
+    group_map = selection_by_group(selected)
+    mutation_count = max(1, int(round(max(1, len(group_map)) * max(0.0, mutation_rate))))
+
+    for _ in range(mutation_count):
+        possible_ops = ["add", "replace"]
+        if group_map:
+            possible_ops.extend(["drop", "swap"])
+        op = rng.choice(possible_ops)
+
+        if op == "add":
+            groups = [group for group in by_group if group not in group_map]
+            if not groups:
+                continue
+            group = rng.choice(groups)
+            group_map[group] = rng.choice(by_group[group])
+        elif op == "replace":
+            groups = list(group_map) or list(by_group)
+            group = rng.choice(groups)
+            options = [
+                row
+                for row in by_group.get(group, [])
+                if str(row.get("source")) != str(group_map.get(group, {}).get("source"))
+            ]
+            if options:
+                group_map[group] = rng.choice(options)
+        elif op == "drop" and group_map:
+            del group_map[rng.choice(list(group_map))]
+        elif op == "swap" and group_map:
+            old_group = rng.choice(list(group_map))
+            del group_map[old_group]
+            groups = [group for group in by_group if group not in group_map]
+            if groups:
+                new_group = rng.choice(groups)
+                group_map[new_group] = rng.choice(by_group[new_group])
+
+        group_map = selection_by_group(repair_selection_to_budget(selection_from_group_map(group_map), budget_extra))
+
+    return selection_from_group_map(group_map)
+
+
+def tournament_select(evaluated: list[dict], rng: random.Random, k: int = 3) -> list[dict]:
+    contenders = [rng.choice(evaluated) for _ in range(min(k, len(evaluated)))]
+    return min(contenders, key=lambda item: (item["nll"], -item["extra_bytes"]))["selected"]
+
+
+def generation_fitness_summary(evaluated: list[dict]) -> dict:
+    nlls = sorted(float(item["nll"]) for item in evaluated)
+    if not nlls:
+        return {"best_nll": None, "median_nll": None, "worst_nll": None}
+    midpoint = len(nlls) // 2
+    if len(nlls) % 2:
+        median = nlls[midpoint]
+    else:
+        median = 0.5 * (nlls[midpoint - 1] + nlls[midpoint])
+    return {
+        "best_nll": nlls[0],
+        "median_nll": float(median),
+        "worst_nll": nlls[-1],
+    }
+
+
+def genetic_search_selection(
+    model,
+    tokenizer,
+    hf,
+    readers: dict[str, dict],
+    groups: dict[str, list[TensorSpec]],
+    args,
+    rows: list[dict],
+    seed_selections: dict[str, list[dict]],
+    base_source: str,
+    budget_extra: int,
+    prompts: list[str],
+    rng: random.Random,
+) -> tuple[list[dict], dict]:
+    population_size = max(2, int(args.genetic_search_population))
+    generations = max(0, int(args.genetic_search_generations))
+    elite_count = max(1, min(population_size, int(args.genetic_search_elite)))
+    mutation_rate = max(0.0, float(args.genetic_search_mutation_rate))
+    cache: dict[tuple[tuple[str, str], ...], dict] = {}
+
+    def normalize(selected: list[dict]) -> list[dict]:
+        return repair_selection_to_budget(selected, budget_extra)
+
+    def add_unique(population: list[list[dict]], selected: list[dict]) -> None:
+        normalized = normalize(selected)
+        sig = selection_signature(normalized)
+        if sig in {selection_signature(item) for item in population}:
+            return
+        population.append(normalized)
+
+    def evaluate(selected: list[dict]) -> dict:
+        sig = selection_signature(selected)
+        if sig not in cache:
+            print(
+                f"[c2] genetic search evaluating genome {len(cache) + 1}: "
+                f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
+                flush=True,
+            )
+            eval_result = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                selected,
+                prompts=prompts,
+                max_length=args.calib_max_length,
+            )
+            cache[sig] = {
+                "nll": float(eval_result["nll"]),
+                "extra_bytes": int(selected_extra_bytes(selected)),
+                "selected": selected,
+            }
+            print(
+                f"[c2] genetic search genome {len(cache)} nll={cache[sig]['nll']:.6f}",
+                flush=True,
+            )
+        return cache[sig]
+
+    population: list[list[dict]] = []
+    for selected in seed_selections.values():
+        add_unique(population, selected)
+    attempts = 0
+    while len(population) < population_size and attempts < population_size * 20:
+        attempts += 1
+        add_unique(population, random_promotion_selection(rows, budget_extra, rng))
+        if len(population) < population_size:
+            seed = rng.choice(population) if population else []
+            add_unique(population, mutate_selection(rows, seed, budget_extra, rng, mutation_rate or 0.25))
+    if not population:
+        population.append([])
+    while len(population) < population_size:
+        population.append(list(rng.choice(population)))
+
+    history: list[dict] = []
+    best: dict | None = None
+    evaluated = [evaluate(selected) for selected in population]
+    evaluated.sort(key=lambda item: (item["nll"], -item["extra_bytes"]))
+    best = evaluated[0]
+    fitness = generation_fitness_summary(evaluated)
+    history.append(
+        {
+            "generation": 0,
+            "best_nll": float(best["nll"]),
+            "generation_best_nll": float(fitness["best_nll"]),
+            "generation_median_nll": float(fitness["median_nll"]),
+            "generation_worst_nll": float(fitness["worst_nll"]),
+            "best_extra_bytes": int(best["extra_bytes"]),
+            "unique_evaluated": len(cache),
+        }
+    )
+    print(
+        f"[c2] genetic search generation 0 fitness "
+        f"best={fitness['best_nll']:.6f} median={fitness['median_nll']:.6f} "
+        f"worst={fitness['worst_nll']:.6f} global_best={best['nll']:.6f} "
+        f"extra={best['extra_bytes']}",
+        flush=True,
+    )
+
+    for generation in range(1, generations + 1):
+        next_population = [item["selected"] for item in evaluated[:elite_count]]
+        attempts = 0
+        while len(next_population) < population_size and attempts < population_size * 20:
+            attempts += 1
+            parent_a = tournament_select(evaluated, rng)
+            parent_b = tournament_select(evaluated, rng)
+            child = crossover_selections(parent_a, parent_b, budget_extra, rng)
+            child = mutate_selection(rows, child, budget_extra, rng, mutation_rate)
+            add_unique(next_population, child)
+            if len(next_population) < population_size and len({selection_signature(item) for item in next_population}) == len(next_population):
+                add_unique(next_population, random_promotion_selection(rows, budget_extra, rng))
+        while len(next_population) < population_size:
+            next_population.append(list(rng.choice(next_population)))
+
+        evaluated = [evaluate(selected) for selected in next_population]
+        evaluated.sort(key=lambda item: (item["nll"], -item["extra_bytes"]))
+        if best is None or evaluated[0]["nll"] < best["nll"]:
+            best = evaluated[0]
+        fitness = generation_fitness_summary(evaluated)
+        history.append(
+            {
+                "generation": generation,
+                "best_nll": float(best["nll"]),
+                "generation_best_nll": float(fitness["best_nll"]),
+                "generation_median_nll": float(fitness["median_nll"]),
+                "generation_worst_nll": float(fitness["worst_nll"]),
+                "best_extra_bytes": int(best["extra_bytes"]),
+                "unique_evaluated": len(cache),
+            }
+        )
+        print(
+            f"[c2] genetic search generation {generation} fitness "
+            f"best={fitness['best_nll']:.6f} median={fitness['median_nll']:.6f} "
+            f"worst={fitness['worst_nll']:.6f} global_best={best['nll']:.6f} "
+            f"unique={len(cache)}",
+            flush=True,
+        )
+
+    assert best is not None
+    report = {
+        "final_nll": float(best["nll"]),
+        "final_extra_bytes": int(best["extra_bytes"]),
+        "generations": generations,
+        "population_size": population_size,
+        "elite_count": elite_count,
+        "mutation_rate": mutation_rate,
+        "direct_search": bool(getattr(args, "genetic_search_direct", False)),
+        "evaluated_genomes": len(cache),
+        "history": history,
+    }
+    return list(best["selected"]), report
 
 
 def add_rank_blend_scores(rows: list[dict], output_key: str, weights: dict[str, float]) -> None:
@@ -1301,6 +1921,45 @@ def make_markdown(result: dict) -> str:
             f"- selected groups: `{len(result['selections'][candidate_variant])}`",
             f"- selected extra bytes: `{candidate_extra}`",
             f"- selected saved bytes: `{candidate_saved}`",
+        ]
+    )
+    local_report = result.get("local_search_reports", {}).get(candidate_variant)
+    genetic_report = result.get("genetic_search_reports", {}).get(candidate_variant)
+    if genetic_report:
+        lines.extend(
+            [
+                "",
+                "## Genetic Search",
+                "",
+                f"- base variant: `{genetic_report['base_variant']}`",
+                f"- generations: `{genetic_report['generations']}`",
+                f"- population size: `{genetic_report['population_size']}`",
+                f"- evaluated genomes: `{genetic_report['evaluated_genomes']}`",
+                f"- calibration final NLL: `{genetic_report['final_nll']:.6f}`",
+                f"- final extra bytes: `{genetic_report['final_extra_bytes']}`",
+            ]
+        )
+    if local_report:
+        lines.extend(
+            [
+                "",
+                "## Local Search Repair",
+                "",
+                f"- base variant: `{local_report['base_variant']}`",
+                f"- calibration start NLL: `{local_report['start_nll']:.6f}`",
+                f"- calibration final NLL: `{local_report['final_nll']:.6f}`",
+                f"- calibration NLL improvement: `{local_report['total_nll_improvement']:.6f}`",
+                f"- evaluated moves: `{local_report['evaluated_moves']}`",
+                f"- accepted moves: `{len(local_report['accepted_moves'])}`",
+            ]
+        )
+        for move in local_report["accepted_moves"]:
+            lines.append(
+                f"- step `{move['step']}`: {move['move']} "
+                f"(calib NLL improvement `{move['nll_improvement']:.6f}`)"
+            )
+    lines.extend(
+        [
             "",
             "## GO / NO-GO",
             "",
@@ -1343,6 +2002,63 @@ def main() -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--candidate-variant", default="c2_calib_greedy_mixed")
     parser.add_argument("--knapsack-max-states", type=int, default=50_000)
+    parser.add_argument(
+        "--local-search-from",
+        default="",
+        help="Base selection variant to repair with whole-model local search.",
+    )
+    parser.add_argument(
+        "--local-search-steps",
+        type=int,
+        default=0,
+        help="Number of accepted local-search repair moves to try. Disabled at 0.",
+    )
+    parser.add_argument(
+        "--local-search-candidates",
+        type=int,
+        default=24,
+        help="Maximum neighbor candidates to evaluate per local-search step.",
+    )
+    parser.add_argument(
+        "--local-search-min-improvement",
+        type=float,
+        default=1e-4,
+        help="Minimum calibration NLL improvement needed to accept a local-search move.",
+    )
+    parser.add_argument(
+        "--genetic-search-from",
+        default="",
+        help="Base selection variant to seed a calibration-NLL genetic search.",
+    )
+    parser.add_argument(
+        "--genetic-search-generations",
+        type=int,
+        default=0,
+        help="Number of genetic-search generations. Disabled at 0.",
+    )
+    parser.add_argument(
+        "--genetic-search-population",
+        type=int,
+        default=8,
+        help="Population size for genetic candidate search.",
+    )
+    parser.add_argument(
+        "--genetic-search-elite",
+        type=int,
+        default=2,
+        help="Elite genomes preserved per generation.",
+    )
+    parser.add_argument(
+        "--genetic-search-mutation-rate",
+        type=float,
+        default=0.25,
+        help="Approximate fraction of selected groups mutated in each child genome.",
+    )
+    parser.add_argument(
+        "--genetic-search-direct",
+        action="store_true",
+        help="Skip per-group promotion NLL scoring and evolve whole promoted subsets directly from byte-accounted options.",
+    )
     parser.add_argument(
         "--sweep-payload-bpws",
         default="",
@@ -1426,38 +2142,42 @@ def main() -> int:
         low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
         print(f"[c2] low-source calibration NLL: {low_calib['nll']:.6f}", flush=True)
 
-        print("[c2] scoring production-format group promotions", flush=True)
-        score_idx = 0
-        score_total = len(groups) * len(high_sources)
-        for group in groups:
-            low_bytes = group_payload_bytes(readers, groups, group, args.low_source)
-            for source in high_sources:
-                score_idx += 1
-                if score_idx == 1 or score_idx % 20 == 0 or score_idx == score_total:
-                    print(f"[c2] scoring group {score_idx}/{score_total}: {group} -> {source}", flush=True)
-                high_bytes = group_payload_bytes(readers, groups, group, source)
-                extra = high_bytes - low_bytes
-                if extra <= 0:
-                    continue
-                patch_group(model, hf, readers, groups, group, source)
-                promoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
-                patch_group(model, hf, readers, groups, group, args.low_source)
-                improvement = low_calib["nll"] - promoted_calib["nll"]
-                weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
-                allocation_rows.append(
-                    {
-                        "group": group,
-                        "source": source,
-                        "low_bytes": int(low_bytes),
-                        "high_bytes": int(high_bytes),
-                        "extra_bytes": int(extra),
-                        "calib_nll": float(promoted_calib["nll"]),
-                        "calib_nll_improvement": float(improvement),
-                        "calib_score_per_mbyte": float(improvement / (extra / 1_000_000)),
-                        "weight_sse_delta": float(weight_delta),
-                        "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
-                    }
-                )
+        if args.genetic_search_direct:
+            print("[c2] building direct-GA promotion options without per-group NLL scoring", flush=True)
+            allocation_rows = build_direct_promotion_rows(readers, groups, args.low_source, high_sources)
+        else:
+            print("[c2] scoring production-format group promotions", flush=True)
+            score_idx = 0
+            score_total = len(groups) * len(high_sources)
+            for group in groups:
+                low_bytes = group_payload_bytes(readers, groups, group, args.low_source)
+                for source in high_sources:
+                    score_idx += 1
+                    if score_idx == 1 or score_idx % 20 == 0 or score_idx == score_total:
+                        print(f"[c2] scoring group {score_idx}/{score_total}: {group} -> {source}", flush=True)
+                    high_bytes = group_payload_bytes(readers, groups, group, source)
+                    extra = high_bytes - low_bytes
+                    if extra <= 0:
+                        continue
+                    patch_group(model, hf, readers, groups, group, source)
+                    promoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                    patch_group(model, hf, readers, groups, group, args.low_source)
+                    improvement = low_calib["nll"] - promoted_calib["nll"]
+                    weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
+                    allocation_rows.append(
+                        {
+                            "group": group,
+                            "source": source,
+                            "low_bytes": int(low_bytes),
+                            "high_bytes": int(high_bytes),
+                            "extra_bytes": int(extra),
+                            "calib_nll": float(promoted_calib["nll"]),
+                            "calib_nll_improvement": float(improvement),
+                            "calib_score_per_mbyte": float(improvement / (extra / 1_000_000)),
+                            "weight_sse_delta": float(weight_delta),
+                            "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
+                        }
+                    )
 
         demotion_rows: list[dict] = []
         if demotion_sources:
@@ -1538,28 +2258,39 @@ def main() -> int:
         )
         raw_selections: dict[str, list[dict]] = {}
         selection_base_sources: dict[str, str] = {}
+        selection_extra_budgets: dict[str, int] = {}
+        genetic_search_reports: dict[str, dict] = {}
+        local_search_reports: dict[str, dict] = {}
 
-        def record_selection(name: str, selected: list[dict], base_source: str) -> None:
+        def record_selection(
+            name: str,
+            selected: list[dict],
+            base_source: str,
+            extra_budget: int | None = None,
+        ) -> None:
             raw_selections[name] = selected
             selections[name] = compact_selection(selected)
             selection_base_sources[name] = base_source
+            if extra_budget is not None:
+                selection_extra_budgets[name] = int(extra_budget)
 
-        record_selection("c2_calib_greedy_mixed", calib_selected, args.low_source)
-        record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source)
-        record_selection("c2_weight_mse_mixed", weight_selected, args.low_source)
-        record_selection("c2_calib_weight_blend_mixed", blend_selected, args.low_source)
+        if not args.genetic_search_direct:
+            record_selection("c2_calib_greedy_mixed", calib_selected, args.low_source, budget_extra)
+            record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source, budget_extra)
+            record_selection("c2_weight_mse_mixed", weight_selected, args.low_source, budget_extra)
+            record_selection("c2_calib_weight_blend_mixed", blend_selected, args.low_source, budget_extra)
 
-        for payload_bpw in sweep_payload_bpws:
-            payload_budget = int(math.floor(payload_bpw * total_weights / 8))
-            sweep_budget_extra = max(0, payload_budget - low_payload)
-            for selector in sweep_selectors:
-                selected = build_promotion_selection(
-                    selector,
-                    allocation_rows,
-                    sweep_budget_extra,
-                    args.knapsack_max_states,
-                )
-                record_selection(sweep_variant_name(selector, payload_bpw), selected, args.low_source)
+            for payload_bpw in sweep_payload_bpws:
+                payload_budget = int(math.floor(payload_bpw * total_weights / 8))
+                sweep_budget_extra = max(0, payload_budget - low_payload)
+                for selector in sweep_selectors:
+                    selected = build_promotion_selection(
+                        selector,
+                        allocation_rows,
+                        sweep_budget_extra,
+                        args.knapsack_max_states,
+                    )
+                    record_selection(sweep_variant_name(selector, payload_bpw), selected, args.low_source, sweep_budget_extra)
 
         demotion_base_payload = source_payload_bytes[demotion_base_source]
         demotion_budget_bpws = sweep_payload_bpws or [low_payload * 8 / total_weights]
@@ -1575,6 +2306,94 @@ def main() -> int:
                         args.knapsack_max_states,
                     )
                     record_selection(demotion_variant_name(selector, payload_bpw), selected, demotion_base_source)
+
+        if int(args.genetic_search_generations) > 0:
+            if args.genetic_search_direct:
+                genetic_base_variant = args.genetic_search_from or "direct_random_population"
+                genetic_base_source = args.low_source
+                genetic_budget_extra = budget_extra
+                genetic_variant = args.candidate_variant if args.candidate_variant.endswith("_genetic_mixed") else "c2_direct_genetic_mixed"
+                seed_variants = {}
+            else:
+                genetic_base_variant = args.genetic_search_from or infer_genetic_search_base_variant(args.candidate_variant)
+                if genetic_base_variant not in raw_selections:
+                    raise ValueError(f"genetic-search base variant {genetic_base_variant!r} is not a selection variant")
+                genetic_base_source = selection_base_sources[genetic_base_variant]
+                if genetic_base_source != args.low_source:
+                    raise ValueError("genetic search currently supports promotion selections from the low source only")
+                genetic_variant = genetic_variant_name(genetic_base_variant)
+                genetic_budget_extra = selection_extra_budgets.get(
+                    genetic_base_variant,
+                    selected_extra_bytes(raw_selections[genetic_base_variant]),
+                )
+                seed_variants = {
+                    name: selected
+                    for name, selected in raw_selections.items()
+                    if selection_base_sources.get(name) == genetic_base_source
+                    and selected_saved_bytes(selected) == 0
+                    and selected_extra_bytes(selected) <= genetic_budget_extra
+                }
+            print(
+                f"[c2] genetic search start base={genetic_base_variant} "
+                f"seeds={len(seed_variants)} budget_extra={genetic_budget_extra}",
+                flush=True,
+            )
+            genetic_selected, report = genetic_search_selection(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                allocation_rows,
+                seed_variants,
+                genetic_base_source,
+                genetic_budget_extra,
+                calib_prompts,
+                py_rng,
+            )
+            report["base_variant"] = genetic_base_variant
+            report["variant"] = genetic_variant
+            report["seed_variants"] = sorted(seed_variants)
+            report["start_extra_bytes"] = int(
+                selected_extra_bytes(raw_selections[genetic_base_variant])
+                if genetic_base_variant in raw_selections
+                else 0
+            )
+            record_selection(genetic_variant, genetic_selected, genetic_base_source, genetic_budget_extra)
+            genetic_search_reports[genetic_variant] = report
+
+        if int(args.local_search_steps) > 0:
+            local_base_variant = args.local_search_from or infer_local_search_base_variant(args.candidate_variant)
+            if local_base_variant not in raw_selections:
+                raise ValueError(f"local-search base variant {local_base_variant!r} is not a selection variant")
+            local_base_source = selection_base_sources[local_base_variant]
+            if local_base_source != args.low_source:
+                raise ValueError("local search currently supports promotion selections from the low source only")
+            local_variant = local_search_variant_name(local_base_variant)
+            local_budget_extra = selection_extra_budgets.get(
+                local_base_variant,
+                selected_extra_bytes(raw_selections[local_base_variant]),
+            )
+            repaired, report = local_search_repair_selection(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                allocation_rows,
+                raw_selections[local_base_variant],
+                local_base_source,
+                local_budget_extra,
+                calib_prompts,
+            )
+            report["base_variant"] = local_base_variant
+            report["variant"] = local_variant
+            report["start_extra_bytes"] = int(selected_extra_bytes(raw_selections[local_base_variant]))
+            report["final_extra_bytes"] = int(selected_extra_bytes(repaired))
+            record_selection(local_variant, repaired, local_base_source, local_budget_extra)
+            local_search_reports[local_variant] = report
 
         if args.candidate_variant not in raw_selections:
             raise ValueError(f"candidate variant {args.candidate_variant!r} is not a selection variant")
@@ -1656,6 +2475,16 @@ def main() -> int:
         "device": args.device,
         "candidate_variant": args.candidate_variant,
         "knapsack_max_states": args.knapsack_max_states,
+        "local_search_from": args.local_search_from,
+        "local_search_steps": args.local_search_steps,
+        "local_search_candidates": args.local_search_candidates,
+        "local_search_min_improvement": args.local_search_min_improvement,
+        "genetic_search_from": args.genetic_search_from,
+        "genetic_search_generations": args.genetic_search_generations,
+        "genetic_search_population": args.genetic_search_population,
+        "genetic_search_elite": args.genetic_search_elite,
+        "genetic_search_mutation_rate": args.genetic_search_mutation_rate,
+        "genetic_search_direct": args.genetic_search_direct,
         "sweep_payload_bpws": sweep_payload_bpws,
         "sweep_selectors": sweep_selectors,
         "demotion_sources": demotion_sources,
@@ -1688,10 +2517,13 @@ def main() -> int:
             "selection_extra_bytes": selection_extra_bytes,
             "selection_saved_bytes": selection_saved_bytes,
             "selection_payload_bytes": selection_payloads,
+            "selection_extra_budgets": selection_extra_budgets,
             "tag_overhead_bits_estimate": int(math.ceil(math.log2(max(2, len(source_paths)))) * len(groups)),
         },
         "allocation_rows": allocation_rows,
         "demotion_rows": demotion_rows,
+        "genetic_search_reports": genetic_search_reports,
+        "local_search_reports": local_search_reports,
         "selection_base_sources": selection_base_sources,
         "selections": selections,
         "variants": results,
