@@ -1366,6 +1366,14 @@ def generation_fitness_summary(evaluated: list[dict]) -> dict:
     }
 
 
+def split_genetic_search_prompts(prompts: list[str], validation_count: int) -> tuple[list[str], list[str]]:
+    validation_count = max(0, int(validation_count))
+    if validation_count <= 0 or len(prompts) <= 1:
+        return list(prompts), []
+    validation_count = min(validation_count, len(prompts) - 1)
+    return list(prompts[:-validation_count]), list(prompts[-validation_count:])
+
+
 def genetic_search_selection(
     model,
     tokenizer,
@@ -1384,7 +1392,20 @@ def genetic_search_selection(
     generations = max(0, int(args.genetic_search_generations))
     elite_count = max(1, min(population_size, int(args.genetic_search_elite)))
     mutation_rate = max(0.0, float(args.genetic_search_mutation_rate))
+    search_prompts, validation_prompts = split_genetic_search_prompts(
+        prompts,
+        int(getattr(args, "genetic_search_validation_prompts", 0) or 0),
+    )
+    rerank_top_k = max(0, int(getattr(args, "genetic_search_rerank_top_k", 0) or 0))
+    if validation_prompts and rerank_top_k <= 0:
+        rerank_top_k = min(population_size, 8)
     cache: dict[tuple[tuple[str, str], ...], dict] = {}
+
+    print(
+        f"[c2] genetic search fitness prompts={len(search_prompts)} "
+        f"validation_prompts={len(validation_prompts)} rerank_top_k={rerank_top_k}",
+        flush=True,
+    )
 
     def normalize(selected: list[dict]) -> list[dict]:
         return repair_selection_to_budget(selected, budget_extra)
@@ -1399,8 +1420,9 @@ def genetic_search_selection(
     def evaluate(selected: list[dict]) -> dict:
         sig = selection_signature(selected)
         if sig not in cache:
+            genome_index = len(cache) + 1
             print(
-                f"[c2] genetic search evaluating genome {len(cache) + 1}: "
+                f"[c2] genetic search evaluating genome {genome_index}: "
                 f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
                 flush=True,
             )
@@ -1413,19 +1435,53 @@ def genetic_search_selection(
                 args,
                 base_source,
                 selected,
-                prompts=prompts,
+                prompts=search_prompts,
                 max_length=args.calib_max_length,
             )
             cache[sig] = {
+                "genome_index": int(genome_index),
                 "nll": float(eval_result["nll"]),
+                "search_nll": float(eval_result["nll"]),
                 "extra_bytes": int(selected_extra_bytes(selected)),
                 "selected": selected,
             }
             print(
-                f"[c2] genetic search genome {len(cache)} nll={cache[sig]['nll']:.6f}",
+                f"[c2] genetic search genome {genome_index} nll={cache[sig]['nll']:.6f}",
                 flush=True,
             )
         return cache[sig]
+
+    def evaluate_validation(finalists: list[dict]) -> list[dict]:
+        if not validation_prompts or not finalists:
+            return finalists
+        for idx, item in enumerate(finalists, start=1):
+            if "validation_nll" in item:
+                continue
+            print(
+                f"[c2] genetic validation evaluating finalist {idx}/{len(finalists)}: "
+                f"genome={item['genome_index']} search_nll={item['search_nll']:.6f} "
+                f"groups={len(item['selected'])} extra={item['extra_bytes']}",
+                flush=True,
+            )
+            eval_result = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                item["selected"],
+                prompts=validation_prompts,
+                max_length=args.calib_max_length,
+            )
+            item["validation_nll"] = float(eval_result["nll"])
+            print(
+                f"[c2] genetic validation finalist genome={item['genome_index']} "
+                f"validation_nll={item['validation_nll']:.6f}",
+                flush=True,
+            )
+        return finalists
 
     population: list[list[dict]] = []
     for selected in seed_selections.values():
@@ -1507,15 +1563,61 @@ def genetic_search_selection(
         )
 
     assert best is not None
+    search_best = best
+    validation_finalists: list[dict] = []
+    if validation_prompts:
+        finalist_count = min(max(1, rerank_top_k), len(cache))
+        validation_finalists = sorted(
+            cache.values(),
+            key=lambda item: (item["search_nll"], -item["extra_bytes"]),
+        )[:finalist_count]
+        evaluate_validation(validation_finalists)
+        best = min(
+            validation_finalists,
+            key=lambda item: (
+                float(item.get("validation_nll", float("inf"))),
+                float(item["search_nll"]),
+                -int(item["extra_bytes"]),
+            ),
+        )
+        print(
+            f"[c2] genetic validation selected genome={best['genome_index']} "
+            f"validation_nll={best['validation_nll']:.6f} "
+            f"search_nll={best['search_nll']:.6f} extra={best['extra_bytes']}",
+            flush=True,
+        )
+
     report = {
-        "final_nll": float(best["nll"]),
+        "final_nll": float(best["search_nll"]),
+        "final_search_nll": float(best["search_nll"]),
+        "final_validation_nll": (
+            float(best["validation_nll"]) if "validation_nll" in best else None
+        ),
+        "search_best_nll": float(search_best["search_nll"]),
+        "search_best_extra_bytes": int(search_best["extra_bytes"]),
         "final_extra_bytes": int(best["extra_bytes"]),
         "generations": generations,
         "population_size": population_size,
         "elite_count": elite_count,
         "mutation_rate": mutation_rate,
         "direct_search": bool(getattr(args, "genetic_search_direct", False)),
+        "fitness_prompt_count": int(len(search_prompts)),
+        "validation_prompt_count": int(len(validation_prompts)),
+        "validation_rerank_top_k": int(rerank_top_k),
+        "selection_metric": "validation_nll" if validation_prompts else "search_nll",
         "evaluated_genomes": len(cache),
+        "validation_finalists": [
+            {
+                "genome_index": int(item["genome_index"]),
+                "search_nll": float(item["search_nll"]),
+                "validation_nll": (
+                    float(item["validation_nll"]) if "validation_nll" in item else None
+                ),
+                "extra_bytes": int(item["extra_bytes"]),
+                "group_count": int(len(item["selected"])),
+            }
+            for item in validation_finalists
+        ],
         "history": history,
     }
     return list(best["selected"]), report
@@ -1935,10 +2037,20 @@ def make_markdown(result: dict) -> str:
                 f"- generations: `{genetic_report['generations']}`",
                 f"- population size: `{genetic_report['population_size']}`",
                 f"- evaluated genomes: `{genetic_report['evaluated_genomes']}`",
-                f"- calibration final NLL: `{genetic_report['final_nll']:.6f}`",
+                f"- fitness prompts: `{genetic_report.get('fitness_prompt_count', 0)}`",
+                f"- validation prompts: `{genetic_report.get('validation_prompt_count', 0)}`",
+                f"- selection metric: `{genetic_report.get('selection_metric', 'search_nll')}`",
+                f"- search final NLL: `{genetic_report.get('final_search_nll', genetic_report['final_nll']):.6f}`",
                 f"- final extra bytes: `{genetic_report['final_extra_bytes']}`",
             ]
         )
+        if genetic_report.get("final_validation_nll") is not None:
+            lines.extend(
+                [
+                    f"- validation final NLL: `{genetic_report['final_validation_nll']:.6f}`",
+                    f"- validation rerank top-k: `{genetic_report.get('validation_rerank_top_k', 0)}`",
+                ]
+            )
     if local_report:
         lines.extend(
             [
@@ -2058,6 +2170,18 @@ def main() -> int:
         "--genetic-search-direct",
         action="store_true",
         help="Skip per-group promotion NLL scoring and evolve whole promoted subsets directly from byte-accounted options.",
+    )
+    parser.add_argument(
+        "--genetic-search-validation-prompts",
+        type=int,
+        default=0,
+        help="Reserve this many calibration prompts as a GA validation fold for top-genome reranking.",
+    )
+    parser.add_argument(
+        "--genetic-search-rerank-top-k",
+        type=int,
+        default=0,
+        help="Number of search-best GA genomes to rerank on the reserved validation fold. Defaults to min(population, 8) when validation prompts are reserved.",
     )
     parser.add_argument(
         "--sweep-payload-bpws",
@@ -2485,6 +2609,8 @@ def main() -> int:
         "genetic_search_elite": args.genetic_search_elite,
         "genetic_search_mutation_rate": args.genetic_search_mutation_rate,
         "genetic_search_direct": args.genetic_search_direct,
+        "genetic_search_validation_prompts": args.genetic_search_validation_prompts,
+        "genetic_search_rerank_top_k": args.genetic_search_rerank_top_k,
         "sweep_payload_bpws": sweep_payload_bpws,
         "sweep_selectors": sweep_selectors,
         "demotion_sources": demotion_sources,

@@ -986,6 +986,15 @@ def run_production_mix_job(job: dict) -> dict:
                 str(job.get("genetic_search_mutation_rate", 0.25)),
             ]
         )
+        if int(job.get("genetic_search_validation_prompts", 0) or 0) > 0:
+            cmd.extend(
+                [
+                    "--genetic-search-validation-prompts",
+                    str(job.get("genetic_search_validation_prompts", 0)),
+                    "--genetic-search-rerank-top-k",
+                    str(job.get("genetic_search_rerank_top_k", 0)),
+                ]
+            )
     if bool(job.get("genetic_search_direct", False)):
         cmd.append("--genetic-search-direct")
     if demotion_sources:
@@ -1116,6 +1125,15 @@ def run_production_mix_configured_job(job: dict) -> dict:
                 str(job.get("genetic_search_mutation_rate", 0.25)),
             ]
         )
+        if int(job.get("genetic_search_validation_prompts", 0) or 0) > 0:
+            cmd.extend(
+                [
+                    "--genetic-search-validation-prompts",
+                    str(job.get("genetic_search_validation_prompts", 0)),
+                    "--genetic-search-rerank-top-k",
+                    str(job.get("genetic_search_rerank_top_k", 0)),
+                ]
+            )
     if bool(job.get("genetic_search_direct", False)):
         cmd.append("--genetic-search-direct")
     if demotion_sources:
@@ -1690,6 +1708,8 @@ def phase_c2_mix(
     genetic_search_elite: int = 2,
     genetic_search_mutation_rate: float = 0.25,
     genetic_search_direct: bool = False,
+    genetic_search_validation_prompts: int = 0,
+    genetic_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1710,6 +1730,10 @@ def phase_c2_mix(
         frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
         if genetic_search_direct:
             frontier_suffix += "_direct"
+        if genetic_search_validation_prompts:
+            frontier_suffix += f"_val{genetic_search_validation_prompts}"
+            if genetic_search_rerank_top_k:
+                frontier_suffix += f"_top{genetic_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1738,6 +1762,8 @@ def phase_c2_mix(
             "genetic_search_elite": genetic_search_elite,
             "genetic_search_mutation_rate": genetic_search_mutation_rate,
             "genetic_search_direct": genetic_search_direct,
+            "genetic_search_validation_prompts": genetic_search_validation_prompts,
+            "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1775,6 +1801,8 @@ def phase_c2_replicate(
     genetic_search_elite: int = 2,
     genetic_search_mutation_rate: float = 0.25,
     genetic_search_direct: bool = False,
+    genetic_search_validation_prompts: int = 0,
+    genetic_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1795,6 +1823,10 @@ def phase_c2_replicate(
         frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
         if genetic_search_direct:
             frontier_suffix += "_direct"
+        if genetic_search_validation_prompts:
+            frontier_suffix += f"_val{genetic_search_validation_prompts}"
+            if genetic_search_rerank_top_k:
+                frontier_suffix += f"_top{genetic_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1825,6 +1857,8 @@ def phase_c2_replicate(
             "genetic_search_elite": genetic_search_elite,
             "genetic_search_mutation_rate": genetic_search_mutation_rate,
             "genetic_search_direct": genetic_search_direct,
+            "genetic_search_validation_prompts": genetic_search_validation_prompts,
+            "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1909,6 +1943,8 @@ def phase_c2_public_calibrated(
     genetic_search_elite: int = 2,
     genetic_search_mutation_rate: float = 0.25,
     genetic_search_direct: bool = False,
+    genetic_search_validation_prompts: int = 0,
+    genetic_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1929,6 +1965,10 @@ def phase_c2_public_calibrated(
         frontier_suffix += f"_genetic_{genetic_search_generations}x{genetic_search_population}"
         if genetic_search_direct:
             frontier_suffix += "_direct"
+        if genetic_search_validation_prompts:
+            frontier_suffix += f"_val{genetic_search_validation_prompts}"
+            if genetic_search_rerank_top_k:
+                frontier_suffix += f"_top{genetic_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = []
@@ -1971,6 +2011,8 @@ def phase_c2_public_calibrated(
                 "genetic_search_elite": genetic_search_elite,
                 "genetic_search_mutation_rate": genetic_search_mutation_rate,
                 "genetic_search_direct": genetic_search_direct,
+                "genetic_search_validation_prompts": genetic_search_validation_prompts,
+                "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
                 "sweep_payload_bpws": sweep_payload_bpws,
                 "sweep_selectors": sweep_selectors,
                 "demotion_sources": demotion_sources,
