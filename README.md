@@ -111,8 +111,8 @@ For a quick pass through the repo, use this order:
 
 1. This README - the showcase-friendly explanation of what PMRA is, how mixing
    works, and why knapsack is the default selector.
-2. [Mixed Model Releases](docs/MIXED_MODEL_RELEASES.md) - chronological release
-   list from newest to oldest.
+2. [PMRA Hugging Face Collection](https://huggingface.co/collections/Asystemoffields/pmra-6a1067359be8a5f82021efe5) -
+   public GGUF mixes and model cards.
 3. [Artifact Index](docs/ARTIFACT_INDEX.md) - released mixes, reports, and
    metrics.
 4. [Method](docs/METHOD.md) - implementation-level method notes.
