@@ -1,0 +1,32 @@
+
+Loading model...
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b1-a8fd165
+model      : gemma4_e2b_it_pmra_calib_knapsack.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> The compression method works because
+
+[Start thinking]
+Thinking Process:
+
+1.  **Analyze the Prompt:** The
+
+[ Prompt: 30.5 t/s | Generation: 10.6 t/s ]

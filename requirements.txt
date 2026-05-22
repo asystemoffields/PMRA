@@ -1,0 +1,10 @@
+accelerate
+datasets
+gguf
+huggingface_hub
+modal
+numpy
+safetensors
+sentencepiece
+torch
+transformers

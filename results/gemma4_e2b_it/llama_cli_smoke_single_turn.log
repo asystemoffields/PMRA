@@ -1,0 +1,37 @@
+
+Loading model...
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b1-a8fd165
+model      : gemma4_e2b_it_pmra_calib_greedy.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> Write a Python function named add_one that returns x + 1.
+
+[Start thinking]
+Thinking Process:
+
+common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+common_memory_breakdown_print: |   - Host               |                 4520 =  2950 +     780 +     790                |
+common_memory_breakdown_print: |   - CPU_REPACK         |                   93 =    93 +       0 +       0                |
+1.  **Analyze the Request:** The user wants a Python function named `add_one` that *returns* (
+
+[ Prompt: 21.9 t/s | Generation: 8.1 t/s ]
+
+Exiting...

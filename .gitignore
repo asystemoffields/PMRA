@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Large model artifacts should live on Hugging Face, not in this method repo.
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Local run output
+tmp/
+modal_logs/
+*.log

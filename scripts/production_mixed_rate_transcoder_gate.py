@@ -1,0 +1,1713 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import random
+import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from types import TracebackType
+
+import numpy as np
+import torch
+from datasets import load_dataset
+from gguf import GGUFReader
+from safetensors import safe_open
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from activation_conditioned_scale_mirage import (
+    DEFAULT_HF,
+    DEFAULT_MODEL_DIR,
+    align_shape,
+    build_prompts,
+    load_hf_tensor,
+    parse_layers,
+)
+from mlp_codebook_model_forward_gate import (
+    copy_array_to_parameter,
+    evaluate_model,
+    load_gguf_tensor_any,
+    patch_layer,
+    patch_non_mlp,
+    set_lm_head_weight,
+    set_weight,
+    strip_logits,
+)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
+
+
+@dataclass(frozen=True)
+class TensorSpec:
+    logical_name: str
+    gguf_name: str
+    group: str
+
+
+class HFTensorSource:
+    def keys(self) -> set[str]:
+        raise NotImplementedError
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class SingleSafetensorsSource(HFTensorSource):
+    def __init__(self, path: Path):
+        self.path = path
+        self._ctx = None
+        self._handle = None
+        self._keys: set[str] = set()
+
+    def __enter__(self) -> "SingleSafetensorsSource":
+        self._ctx = safe_open(str(self.path), framework="pt", device="cpu")
+        self._handle = self._ctx.__enter__()
+        self._keys = set(self._handle.keys())
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._ctx is not None:
+            self._ctx.__exit__(exc_type, exc, tb)
+
+    def keys(self) -> set[str]:
+        return self._keys
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        if self._handle is None:
+            raise RuntimeError("HF tensor source is not open")
+        return self._handle.get_tensor(name)
+
+
+class ShardedSafetensorsSource(HFTensorSource):
+    def __init__(self, index_path: Path):
+        self.index_path = index_path
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        self.weight_map: dict[str, str] = index["weight_map"]
+        self._contexts = {}
+        self._handles = {}
+
+    def __enter__(self) -> "ShardedSafetensorsSource":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        for ctx in self._contexts.values():
+            ctx.__exit__(exc_type, exc, tb)
+        self._contexts.clear()
+        self._handles.clear()
+
+    def keys(self) -> set[str]:
+        return set(self.weight_map)
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        if name not in self.weight_map:
+            raise KeyError(f"missing HF tensor {name}")
+        shard = self.weight_map[name]
+        if shard not in self._handles:
+            shard_path = self.index_path.parent / shard
+            ctx = safe_open(str(shard_path), framework="pt", device="cpu")
+            self._contexts[shard] = ctx
+            self._handles[shard] = ctx.__enter__()
+        return self._handles[shard].get_tensor(name)
+
+
+def open_hf_tensor_source(path: str | Path) -> HFTensorSource:
+    hf_path = Path(path)
+    if hf_path.name.endswith(".safetensors.index.json"):
+        return ShardedSafetensorsSource(hf_path)
+    return SingleSafetensorsSource(hf_path)
+
+
+def parse_source_specs(items: list[str]) -> dict[str, Path]:
+    sources: dict[str, Path] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"source must look like label=path, got {item!r}")
+        label, path = item.split("=", 1)
+        label = label.strip()
+        if not label:
+            raise ValueError(f"empty source label in {item!r}")
+        sources[label] = Path(path.strip())
+    if not sources:
+        raise ValueError("at least one --source label=path is required")
+    return sources
+
+
+def parse_csv(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def parse_float_csv(text: str | None) -> list[float]:
+    return [float(part) for part in parse_csv(text)]
+
+
+def source_readers(paths: dict[str, Path]) -> dict[str, dict]:
+    readers = {}
+    for label, path in paths.items():
+        print(f"[c2] loading GGUF source {label}: {path}", flush=True)
+        reader = GGUFReader(str(path))
+        readers[label] = {tensor.name: tensor for tensor in reader.tensors}
+    return readers
+
+
+def load_model_for_profile(model_dir: str, tensor_profile: str, device: torch.device):
+    if tensor_profile not in {"qwen", "qwen35", "gemma4", "mistral3", "granite", "olmo2", "olmo3"}:
+        raise ValueError(f"unknown tensor profile {tensor_profile!r}")
+    model_cls = AutoModelForCausalLM
+    if tensor_profile == "mistral3":
+        from transformers import Mistral3ForConditionalGeneration
+
+        model_cls = Mistral3ForConditionalGeneration
+    elif tensor_profile == "qwen35":
+        try:
+            from transformers import Qwen3_5ForConditionalGeneration
+
+            model_cls = Qwen3_5ForConditionalGeneration
+        except ImportError:
+            model_cls = AutoModelForCausalLM
+    return model_cls.from_pretrained(
+        model_dir,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    ).to(device).eval()
+
+
+def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str = "qwen") -> list[TensorSpec]:
+    if tensor_profile in {"qwen", "granite", "olmo2", "olmo3"}:
+        specs: list[TensorSpec] = [
+            TensorSpec("model.embed_tokens.weight", "token_embd.weight", "global:embed"),
+            TensorSpec("lm_head.weight", "output.weight", "global:output"),
+            TensorSpec("model.norm.weight", "output_norm.weight", "global:norm"),
+        ]
+    elif tensor_profile in {"mistral3", "qwen35"}:
+        hf_root = "model.language_model"
+        specs = [
+            TensorSpec(f"{hf_root}.embed_tokens.weight", "token_embd.weight", "global:embed"),
+            TensorSpec("lm_head.weight", "output.weight", "global:output"),
+            TensorSpec(f"{hf_root}.norm.weight", "output_norm.weight", "global:norm"),
+        ]
+    elif tensor_profile == "gemma4":
+        specs = [
+            TensorSpec("model.language_model.norm.weight", "output_norm.weight", "global:norm"),
+            TensorSpec(
+                "model.language_model.per_layer_model_projection.weight",
+                "per_layer_model_proj.weight",
+                "global:per_layer_model_proj",
+            ),
+            TensorSpec(
+                "model.language_model.per_layer_projection_norm.weight",
+                "per_layer_proj_norm.weight",
+                "global:per_layer_proj_norm",
+            ),
+            TensorSpec(
+                "model.language_model.embed_tokens_per_layer.weight",
+                "per_layer_token_embd.weight",
+                "global:per_layer_token_embd",
+            ),
+            TensorSpec("model.language_model.embed_tokens.weight", "token_embd.weight", "global:embed"),
+        ]
+    else:
+        raise ValueError(f"unknown tensor profile {tensor_profile!r}")
+
+    for layer in layers:
+        if tensor_profile == "gemma4":
+            hf_prefix = f"model.language_model.layers.{layer}"
+        elif tensor_profile in {"mistral3", "qwen35"}:
+            hf_prefix = f"model.language_model.layers.{layer}"
+        else:
+            hf_prefix = f"model.layers.{layer}"
+        gguf_prefix = f"blk.{layer}"
+        if group_mode == "layer_family":
+            attn_group = f"L{layer}:attn"
+            mlp_group = f"L{layer}:mlp"
+            per_layer_group = f"L{layer}:per_layer"
+        elif group_mode == "tensor":
+            attn_group = ""
+            mlp_group = ""
+            per_layer_group = ""
+        else:
+            raise ValueError(f"unknown group mode {group_mode}")
+
+        attn_pairs = [
+            ("self_attn.q_proj.weight", "attn_q.weight", "attn_q"),
+            ("self_attn.k_proj.weight", "attn_k.weight", "attn_k"),
+            ("self_attn.v_proj.weight", "attn_v.weight", "attn_v"),
+            ("self_attn.o_proj.weight", "attn_output.weight", "attn_output"),
+        ]
+        for hf_tail, gguf_tail, short in attn_pairs:
+            group = attn_group or f"L{layer}:{short}"
+            specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+
+        if tensor_profile == "qwen35":
+            linear_attn_pairs = [
+                ("linear_attn.in_proj_qkv.weight", "attn_qkv.weight", "attn_qkv"),
+                ("linear_attn.in_proj_z.weight", "attn_gate.weight", "attn_gate"),
+                ("linear_attn.A_log", "ssm_a", "ssm_a"),
+                ("linear_attn.conv1d.weight", "ssm_conv1d.weight", "ssm_conv1d"),
+                ("linear_attn.dt_bias", "ssm_dt.bias", "ssm_dt"),
+                ("linear_attn.norm.weight", "ssm_norm.weight", "ssm_norm"),
+                ("linear_attn.out_proj.weight", "ssm_out.weight", "ssm_out"),
+                ("linear_attn.in_proj_a.weight", "ssm_alpha.weight", "ssm_alpha"),
+                ("linear_attn.in_proj_b.weight", "ssm_beta.weight", "ssm_beta"),
+            ]
+            for hf_tail, gguf_tail, short in linear_attn_pairs:
+                group = attn_group or f"L{layer}:{short}"
+                specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+
+        mlp_pairs = [
+            ("mlp.gate_proj.weight", "ffn_gate.weight", "ffn_gate"),
+            ("mlp.up_proj.weight", "ffn_up.weight", "ffn_up"),
+            ("mlp.down_proj.weight", "ffn_down.weight", "ffn_down"),
+        ]
+        for hf_tail, gguf_tail, short in mlp_pairs:
+            group = mlp_group or f"L{layer}:{short}"
+            specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+
+        if tensor_profile in {"olmo2", "olmo3"}:
+            norm_pairs = [
+                ("post_attention_layernorm.weight", "post_attention_norm.weight", "post_attention_norm"),
+                ("post_feedforward_layernorm.weight", "post_ffw_norm.weight", "post_ffw_norm"),
+            ]
+        else:
+            norm_pairs = [
+                ("input_layernorm.weight", "attn_norm.weight", "attn_norm"),
+                (
+                    "post_attention_layernorm.weight",
+                    "post_attention_norm.weight" if tensor_profile in {"gemma4", "qwen35"} else "ffn_norm.weight",
+                    "post_attention_norm" if tensor_profile in {"gemma4", "qwen35"} else "ffn_norm",
+                ),
+            ]
+        if tensor_profile != "granite":
+            norm_pairs.extend(
+                [
+                    ("self_attn.q_norm.weight", "attn_q_norm.weight", "attn_q_norm"),
+                    ("self_attn.k_norm.weight", "attn_k_norm.weight", "attn_k_norm"),
+                ]
+            )
+        for hf_tail, gguf_tail, short in norm_pairs:
+            group = attn_group if short.startswith("attn") else mlp_group
+            group = group or f"L{layer}:{short}"
+            specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+        if tensor_profile == "gemma4":
+            gemma_pairs = [
+                ("pre_feedforward_layernorm.weight", "ffn_norm.weight", "ffn_norm"),
+                ("post_feedforward_layernorm.weight", "post_ffw_norm.weight", "post_ffw_norm"),
+                ("post_per_layer_input_norm.weight", "post_norm.weight", "post_norm"),
+                ("per_layer_input_gate.weight", "inp_gate.weight", "per_layer_inp_gate"),
+                ("per_layer_projection.weight", "proj.weight", "per_layer_proj"),
+                ("layer_scalar", "layer_output_scale.weight", "layer_output_scale"),
+            ]
+            for hf_tail, gguf_tail, short in gemma_pairs:
+                if short.startswith("per_layer"):
+                    group = per_layer_group or f"L{layer}:{short}"
+                else:
+                    group = mlp_group or f"L{layer}:{short}"
+                specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+    return specs
+
+
+def group_specs(specs: list[TensorSpec]) -> dict[str, list[TensorSpec]]:
+    groups: dict[str, list[TensorSpec]] = {}
+    for spec in specs:
+        groups.setdefault(spec.group, []).append(spec)
+    return groups
+
+
+def filter_specs_for_model(model, specs: list[TensorSpec], log_prefix: str = "[c2]") -> tuple[list[TensorSpec], list[TensorSpec]]:
+    model_tensor_names = set(dict(model.named_parameters()).keys()) | set(dict(model.named_buffers()).keys())
+    kept = []
+    skipped = []
+    for spec in specs:
+        if spec.logical_name in model_tensor_names or spec.logical_name == "lm_head.weight":
+            kept.append(spec)
+        else:
+            skipped.append(spec)
+    if skipped:
+        print(
+            f"{log_prefix} skipped {len(skipped)} specs absent from the loaded model: "
+            f"{', '.join(spec.logical_name for spec in skipped[:8])}",
+            flush=True,
+        )
+    return kept, skipped
+
+
+def filter_specs_for_sources(
+    readers: dict[str, dict],
+    specs: list[TensorSpec],
+    log_prefix: str = "[c2]",
+) -> tuple[list[TensorSpec], list[TensorSpec]]:
+    kept = []
+    skipped = []
+    for spec in specs:
+        if all(spec.gguf_name in tensors for tensors in readers.values()):
+            kept.append(spec)
+        else:
+            skipped.append(spec)
+    if skipped:
+        print(
+            f"{log_prefix} skipped {len(skipped)} specs absent from at least one GGUF source: "
+            f"{', '.join(spec.gguf_name for spec in skipped[:8])}",
+            flush=True,
+        )
+    return kept, skipped
+
+
+def hf_ref_array(hf, model, spec: TensorSpec) -> np.ndarray:
+    if spec.logical_name in hf.keys():
+        return load_hf_tensor(hf, spec.logical_name)
+    if spec.logical_name == "lm_head.weight":
+        if "lm_head.weight" in hf.keys():
+            return load_hf_tensor(hf, "lm_head.weight")
+        return model.lm_head.weight.detach().to(torch.float32).cpu().numpy()
+    params = dict(model.named_parameters())
+    if spec.logical_name in params:
+        return params[spec.logical_name].detach().to(torch.float32).cpu().numpy()
+    buffers = dict(model.named_buffers())
+    if spec.logical_name in buffers:
+        return buffers[spec.logical_name].detach().to(torch.float32).cpu().numpy()
+    raise KeyError(f"missing HF tensor {spec.logical_name}")
+
+
+def patch_tensor(model, hf, source_tensors: dict, spec: TensorSpec) -> None:
+    ref = hf_ref_array(hf, model, spec)
+    arr = align_shape(ref, load_gguf_tensor_any(source_tensors, spec.gguf_name))
+    name = spec.logical_name
+    params = dict(model.named_parameters())
+    if name in params:
+        copy_array_to_parameter(params[name], arr)
+        return
+    buffers = dict(model.named_buffers())
+    if name in buffers:
+        copy_array_to_parameter(buffers[name], arr)
+        return
+    if name == "model.embed_tokens.weight":
+        copy_array_to_parameter(model.model.embed_tokens.weight, arr)
+        return
+    if name == "lm_head.weight":
+        set_lm_head_weight(model, arr)
+        return
+    if name == "model.norm.weight":
+        copy_array_to_parameter(model.model.norm.weight, arr)
+        return
+
+    parts = name.split(".")
+    layer = int(parts[2])
+    layer_mod = model.model.layers[layer]
+    if ".self_attn." in name:
+        attn = layer_mod.self_attn
+        if name.endswith("q_proj.weight"):
+            set_weight(attn, "q_proj", arr)
+        elif name.endswith("k_proj.weight"):
+            set_weight(attn, "k_proj", arr)
+        elif name.endswith("v_proj.weight"):
+            set_weight(attn, "v_proj", arr)
+        elif name.endswith("o_proj.weight"):
+            set_weight(attn, "o_proj", arr)
+        elif name.endswith("q_norm.weight"):
+            copy_array_to_parameter(attn.q_norm.weight, arr)
+        elif name.endswith("k_norm.weight"):
+            copy_array_to_parameter(attn.k_norm.weight, arr)
+        else:
+            raise ValueError(f"unhandled attention tensor {name}")
+        return
+    if ".mlp." in name:
+        mlp = layer_mod.mlp
+        if name.endswith("gate_proj.weight"):
+            set_weight(mlp, "gate_proj", arr)
+        elif name.endswith("up_proj.weight"):
+            set_weight(mlp, "up_proj", arr)
+        elif name.endswith("down_proj.weight"):
+            set_weight(mlp, "down_proj", arr)
+        else:
+            raise ValueError(f"unhandled MLP tensor {name}")
+        return
+    if name.endswith("input_layernorm.weight"):
+        copy_array_to_parameter(layer_mod.input_layernorm.weight, arr)
+        return
+    if name.endswith("post_attention_layernorm.weight"):
+        copy_array_to_parameter(layer_mod.post_attention_layernorm.weight, arr)
+        return
+    raise ValueError(f"unhandled tensor {name}")
+
+
+def patch_group(model, hf, readers: dict[str, dict], groups: dict[str, list[TensorSpec]], group: str, source: str) -> None:
+    for spec in groups[group]:
+        patch_tensor(model, hf, readers[source], spec)
+
+
+def patch_all_from_source(
+    model,
+    hf,
+    readers: dict[str, dict],
+    layers: list[int],
+    source: str,
+    group_mode: str = "tensor",
+    tensor_profile: str = "qwen",
+) -> None:
+    tensors = readers[source]
+    specs, _skipped = filter_specs_for_model(
+        model,
+        build_tensor_specs(layers, group_mode, tensor_profile),
+    )
+    for spec in specs:
+        if spec.gguf_name in tensors:
+            patch_tensor(model, hf, tensors, spec)
+
+
+def tensor_payload_bytes(tensors: dict, spec: TensorSpec) -> int:
+    return int(tensors[spec.gguf_name].data.nbytes)
+
+
+def payload_bytes_by_source(readers: dict[str, dict], specs: list[TensorSpec]) -> dict[str, int]:
+    out = {}
+    for label, tensors in readers.items():
+        out[label] = int(sum(tensor_payload_bytes(tensors, spec) for spec in specs if spec.gguf_name in tensors))
+    return out
+
+
+def group_payload_bytes(readers: dict[str, dict], groups: dict[str, list[TensorSpec]], group: str, source: str) -> int:
+    return int(sum(tensor_payload_bytes(readers[source], spec) for spec in groups[group]))
+
+
+def total_weight_count(hf, model, specs: list[TensorSpec]) -> int:
+    total = 0
+    for spec in specs:
+        total += int(hf_ref_array(hf, model, spec).size)
+    return total
+
+
+def evaluate_nll(model, tokenizer, prompts: list[str], max_length: int) -> dict:
+    total_nll = 0.0
+    total_tokens = 0
+    device = next(model.parameters()).device
+    with torch.inference_mode():
+        for prompt in prompts:
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+            ids = encoded.input_ids.to(device)
+            if ids.shape[-1] < 2:
+                continue
+            out = model(input_ids=ids, labels=ids, use_cache=False)
+            count = int(ids.shape[-1] - 1)
+            total_nll += float(out.loss.detach().cpu()) * count
+            total_tokens += count
+    nll = total_nll / max(1, total_tokens)
+    return {"tokens": int(total_tokens), "nll": float(nll), "ppl": float(math.exp(nll))}
+
+
+def prompt_hash(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+
+
+def aggregate_prompt_hash(prompts: list[str]) -> str:
+    joined = "\n---PMRA-PROMPT---\n".join(prompts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def build_disjoint_prompt_split(tokenizer, calib_count: int, eval_count: int, seed: int) -> tuple[list[str], list[str], dict]:
+    prompts = build_prompts(tokenizer, calib_count + eval_count, seed)
+    calib_prompts = prompts[:calib_count]
+    eval_prompts = prompts[calib_count:]
+    overlap = set(calib_prompts) & set(eval_prompts)
+    if overlap:
+        raise AssertionError(f"calibration/eval prompt overlap detected: {len(overlap)}")
+    return calib_prompts, eval_prompts, {
+        "split": "single_stream_disjoint",
+        "seed": int(seed),
+        "calib_prompt_hashes": [prompt_hash(prompt) for prompt in calib_prompts],
+        "eval_prompt_hashes": [prompt_hash(prompt) for prompt in eval_prompts],
+        "overlap_count": 0,
+    }
+
+
+def load_public_prompt_chunks(
+    tokenizer,
+    dataset: str,
+    dataset_config: str | None,
+    split: str,
+    text_column: str,
+    prompt_count: int,
+    seed: int,
+    max_length: int,
+    min_tokens: int,
+) -> list[str]:
+    ds = load_dataset(dataset, dataset_config, split=split) if dataset_config else load_dataset(dataset, split=split)
+    chunks: list[str] = []
+    buffer: list[str] = []
+    char_floor = max(400, max_length * 4)
+
+    for row in ds:
+        text = str(row.get(text_column, "")).strip()
+        if not text:
+            continue
+        buffer.append(text)
+        candidate = "\n\n".join(buffer)
+        if len(candidate) < char_floor:
+            continue
+        token_count = len(tokenizer(candidate, add_special_tokens=True).input_ids)
+        if token_count >= min_tokens:
+            chunks.append(candidate)
+            buffer = []
+
+    if buffer:
+        candidate = "\n\n".join(buffer)
+        if len(tokenizer(candidate, add_special_tokens=True).input_ids) >= min_tokens:
+            chunks.append(candidate)
+
+    if len(chunks) < prompt_count:
+        raise RuntimeError(f"public split {split!r} produced only {len(chunks)} usable chunks; requested {prompt_count}")
+
+    rng = random.Random(seed)
+    rng.shuffle(chunks)
+    return chunks[:prompt_count]
+
+
+def public_prompt_audit(
+    tokenizer,
+    dataset: str,
+    dataset_config: str | None,
+    text_column: str,
+    calib_split: str,
+    eval_split: str,
+    seed: int,
+    calib_prompts: list[str],
+    eval_prompts: list[str],
+    calib_max_length: int,
+    eval_max_length: int,
+    min_tokens: int,
+) -> dict:
+    calib_lengths = [
+        min(len(tokenizer(prompt, add_special_tokens=True).input_ids), calib_max_length)
+        for prompt in calib_prompts
+    ]
+    eval_lengths = [
+        min(len(tokenizer(prompt, add_special_tokens=True).input_ids), eval_max_length)
+        for prompt in eval_prompts
+    ]
+    overlap = set(calib_prompts) & set(eval_prompts)
+    return {
+        "split": "public_disjoint",
+        "dataset": dataset,
+        "dataset_config": dataset_config,
+        "text_column": text_column,
+        "calib_split": calib_split,
+        "eval_split": eval_split,
+        "seed": int(seed),
+        "calib_prompt_count": int(len(calib_prompts)),
+        "eval_prompt_count": int(len(eval_prompts)),
+        "calib_max_length": int(calib_max_length),
+        "eval_max_length": int(eval_max_length),
+        "min_tokens": int(min_tokens),
+        "calib_prompt_hash_sha256": aggregate_prompt_hash(calib_prompts),
+        "eval_prompt_hash_sha256": aggregate_prompt_hash(eval_prompts),
+        "calib_prompt_hashes_first16": [prompt_hash(prompt) for prompt in calib_prompts[:16]],
+        "eval_prompt_hashes_first16": [prompt_hash(prompt) for prompt in eval_prompts[:16]],
+        "calib_mean_truncated_tokens": float(sum(calib_lengths) / max(1, len(calib_lengths))),
+        "eval_mean_truncated_tokens": float(sum(eval_lengths) / max(1, len(eval_lengths))),
+        "overlap_count": int(len(overlap)),
+    }
+
+
+def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], dict]:
+    seed = args.prompt_seed if args.prompt_seed is not None else args.seed + 2000
+    if args.calib_split == args.eval_split:
+        prompts = load_public_prompt_chunks(
+            tokenizer,
+            args.dataset,
+            args.dataset_config,
+            args.calib_split,
+            args.text_column,
+            args.calib_prompts + args.eval_prompts,
+            seed,
+            max(args.calib_max_length, args.eval_max_length),
+            args.min_tokens,
+        )
+        calib_prompts = prompts[: args.calib_prompts]
+        eval_prompts = prompts[args.calib_prompts :]
+    else:
+        calib_prompts = load_public_prompt_chunks(
+            tokenizer,
+            args.dataset,
+            args.dataset_config,
+            args.calib_split,
+            args.text_column,
+            args.calib_prompts,
+            seed,
+            args.calib_max_length,
+            args.min_tokens,
+        )
+        eval_prompts = load_public_prompt_chunks(
+            tokenizer,
+            args.dataset,
+            args.dataset_config,
+            args.eval_split,
+            args.text_column,
+            args.eval_prompts,
+            seed + 17,
+            args.eval_max_length,
+            args.min_tokens,
+        )
+    audit = public_prompt_audit(
+        tokenizer,
+        args.dataset,
+        args.dataset_config,
+        args.text_column,
+        args.calib_split,
+        args.eval_split,
+        seed,
+        calib_prompts,
+        eval_prompts,
+        args.calib_max_length,
+        args.eval_max_length,
+        args.min_tokens,
+    )
+    if audit["overlap_count"]:
+        raise AssertionError(f"calibration/eval prompt overlap detected: {audit['overlap_count']}")
+    return calib_prompts, eval_prompts, audit
+
+
+def group_weight_sse_delta(hf, model, readers: dict[str, dict], groups: dict[str, list[TensorSpec]], group: str, low: str, source: str) -> float:
+    low_sse = 0.0
+    high_sse = 0.0
+    for spec in groups[group]:
+        ref = hf_ref_array(hf, model, spec)
+        low_arr = align_shape(ref, load_gguf_tensor_any(readers[low], spec.gguf_name))
+        high_arr = align_shape(ref, load_gguf_tensor_any(readers[source], spec.gguf_name))
+        low_sse += float(np.sum((ref - low_arr) ** 2))
+        high_sse += float(np.sum((ref - high_arr) ** 2))
+    return low_sse - high_sse
+
+
+def select_by_score(rows: list[dict], budget_extra: int, score_key: str) -> list[dict]:
+    selected: list[dict] = []
+    seen_groups: set[str] = set()
+    used = 0
+    ranked = sorted(rows, key=lambda row: row.get(score_key, float("-inf")), reverse=True)
+    for row in ranked:
+        if row["group"] in seen_groups:
+            continue
+        if row["extra_bytes"] <= 0:
+            continue
+        if row.get(score_key, 0.0) <= 0.0:
+            continue
+        if used + row["extra_bytes"] > budget_extra:
+            continue
+        selected.append(row)
+        seen_groups.add(row["group"])
+        used += row["extra_bytes"]
+    return selected
+
+
+def prune_knapsack_states(
+    states: list[tuple[int, float, tuple[dict, ...]]],
+    max_states: int,
+) -> list[tuple[int, float, tuple[dict, ...]]]:
+    max_states = max(1, int(max_states))
+    best_by_used: dict[int, tuple[float, tuple[dict, ...]]] = {}
+    for used, value, selected in states:
+        previous = best_by_used.get(used)
+        if previous is None or value > previous[0]:
+            best_by_used[used] = (value, selected)
+
+    frontier: list[tuple[int, float, tuple[dict, ...]]] = []
+    best_value = float("-inf")
+    for used in sorted(best_by_used):
+        value, selected = best_by_used[used]
+        if value <= best_value + 1e-12:
+            continue
+        frontier.append((used, value, selected))
+        best_value = value
+
+    if len(frontier) <= max_states:
+        return frontier
+
+    keep: dict[int, tuple[int, float, tuple[dict, ...]]] = {}
+    value_keep_count = max(1, max_states // 2)
+    for state in sorted(frontier, key=lambda item: (item[1], -item[0]), reverse=True)[:value_keep_count]:
+        keep[state[0]] = state
+
+    spread_count = max_states - len(keep)
+    if spread_count > 0:
+        denom = max(1, spread_count - 1)
+        last_idx = len(frontier) - 1
+        for idx in range(spread_count):
+            state = frontier[round(idx * last_idx / denom)]
+            previous = keep.get(state[0])
+            if previous is None or state[1] > previous[1]:
+                keep[state[0]] = state
+
+    limited = sorted(keep.values(), key=lambda item: item[0])
+    if len(limited) > max_states:
+        limited = sorted(limited, key=lambda item: (item[1], -item[0]), reverse=True)[:max_states]
+        limited.sort(key=lambda item: item[0])
+    return limited
+
+
+def select_exact_scaled_knapsack(
+    options_by_group: dict[str, list[dict]],
+    budget_extra: int,
+    value_key: str,
+    byte_unit: int,
+) -> list[dict]:
+    budget_units = budget_extra // byte_unit
+    groups = sorted(options_by_group)
+    neg_inf = float("-inf")
+    dp = [neg_inf] * (budget_units + 1)
+    dp[0] = 0.0
+    parent_choices: list[list[int]] = []
+    parent_used: list[list[int]] = []
+    stage_options: list[list[dict]] = []
+
+    for group in groups:
+        options = sorted(
+            options_by_group[group],
+            key=lambda row: (
+                float(row.get(value_key, 0.0)),
+                -int(row.get("extra_bytes", 0)),
+                row["source"],
+            ),
+            reverse=True,
+        )
+        next_dp = dp[:]
+        choices = [-1] * (budget_units + 1)
+        previous = [-1] * (budget_units + 1)
+        for option_idx, row in enumerate(options):
+            weight = int(row["extra_bytes"]) // byte_unit
+            value = float(row[value_key])
+            if weight > budget_units:
+                continue
+            for used, current in enumerate(dp[: budget_units - weight + 1]):
+                if current == neg_inf:
+                    continue
+                next_used = used + weight
+                candidate = current + value
+                if candidate > next_dp[next_used] + 1e-12:
+                    next_dp[next_used] = candidate
+                    choices[next_used] = option_idx
+                    previous[next_used] = used
+        dp = next_dp
+        parent_choices.append(choices)
+        parent_used.append(previous)
+        stage_options.append(options)
+
+    best_used = max(range(budget_units + 1), key=lambda used: (dp[used], -used))
+    selected: list[dict] = []
+    used = best_used
+    for choices, previous, options in zip(reversed(parent_choices), reversed(parent_used), reversed(stage_options)):
+        option_idx = choices[used]
+        if option_idx >= 0:
+            selected.append(options[option_idx])
+            used = previous[used]
+    selected.reverse()
+    return selected
+
+
+def select_knapsack_by_value(
+    rows: list[dict],
+    budget_extra: int,
+    value_key: str,
+    max_states: int = 50_000,
+) -> list[dict]:
+    max_states = max(1, int(max_states))
+    options_by_group: dict[str, list[dict]] = {}
+    for row in rows:
+        extra = int(row.get("extra_bytes", 0))
+        value = float(row.get(value_key, 0.0))
+        if extra <= 0 or value <= 0.0 or extra > budget_extra:
+            continue
+        options_by_group.setdefault(row["group"], []).append(row)
+
+    byte_unit = int(budget_extra)
+    for options in options_by_group.values():
+        for row in options:
+            byte_unit = math.gcd(byte_unit, int(row["extra_bytes"]))
+    if byte_unit > 0 and budget_extra // byte_unit <= max_states:
+        return select_exact_scaled_knapsack(options_by_group, budget_extra, value_key, byte_unit)
+
+    states: list[tuple[int, float, tuple[dict, ...]]] = [(0, 0.0, ())]
+    for group in sorted(options_by_group):
+        options = sorted(
+            options_by_group[group],
+            key=lambda row: (
+                float(row.get(value_key, 0.0)),
+                -int(row.get("extra_bytes", 0)),
+                row["source"],
+            ),
+            reverse=True,
+        )
+        next_states = states[:]
+        for used, value, selected in states:
+            for row in options:
+                next_used = used + int(row["extra_bytes"])
+                if next_used > budget_extra:
+                    continue
+                next_states.append((next_used, value + float(row[value_key]), selected + (row,)))
+        states = prune_knapsack_states(next_states, max_states)
+
+    best = max(states, key=lambda item: (item[1], -item[0]))
+    return list(best[2])
+
+
+def build_promotion_selection(
+    selector: str,
+    rows: list[dict],
+    budget_extra: int,
+    max_states: int,
+) -> list[dict]:
+    selector = selector.strip()
+    if selector in {"greedy", "calib_greedy"}:
+        return select_by_score(rows, budget_extra, "calib_score_per_mbyte")
+    if selector in {"knapsack", "calib_knapsack"}:
+        return select_knapsack_by_value(rows, budget_extra, "calib_nll_improvement", max_states)
+    if selector in {"weight", "weight_mse"}:
+        return select_by_score(rows, budget_extra, "weight_score_per_mbyte")
+    if selector in {"blend", "calib_weight_blend"}:
+        return select_by_score(rows, budget_extra, "calib_weight_rank_blend")
+    raise ValueError(f"unknown promotion sweep selector {selector!r}")
+
+
+def promotion_selector_variant_prefix(selector: str) -> str:
+    selector = selector.strip()
+    if selector in {"greedy", "calib_greedy"}:
+        return "c2_calib_greedy"
+    if selector in {"knapsack", "calib_knapsack"}:
+        return "c2_calib_knapsack"
+    if selector in {"weight", "weight_mse"}:
+        return "c2_weight_mse"
+    if selector in {"blend", "calib_weight_blend"}:
+        return "c2_calib_weight_blend"
+    raise ValueError(f"unknown promotion sweep selector {selector!r}")
+
+
+def bpw_tag(value: float) -> str:
+    return f"{value:.3f}".replace("-", "m").replace(".", "p")
+
+
+def sweep_variant_name(selector: str, payload_bpw: float) -> str:
+    return f"{promotion_selector_variant_prefix(selector)}_bpw_{bpw_tag(payload_bpw)}_mixed"
+
+
+def add_rank_blend_scores(rows: list[dict], output_key: str, weights: dict[str, float]) -> None:
+    eligible = [row for row in rows if row["extra_bytes"] > 0]
+    if not eligible:
+        return
+    for key, weight in weights.items():
+        ranked = sorted(eligible, key=lambda row: row.get(key, float("-inf")))
+        denom = max(1, len(ranked) - 1)
+        for rank, row in enumerate(ranked):
+            row[output_key] = float(row.get(output_key, 0.0) + weight * (rank / denom))
+
+
+def select_random(rows: list[dict], budget_extra: int, rng: random.Random, trials: int = 64) -> list[dict]:
+    eligible = [row for row in rows if row["extra_bytes"] > 0]
+    best: list[dict] = []
+    best_used = -1
+    for _ in range(trials):
+        trial = eligible[:]
+        rng.shuffle(trial)
+        selected = []
+        seen_groups: set[str] = set()
+        used = 0
+        for row in trial:
+            if row["group"] in seen_groups:
+                continue
+            if used + row["extra_bytes"] > budget_extra:
+                continue
+            selected.append(row)
+            seen_groups.add(row["group"])
+            used += row["extra_bytes"]
+        if used > best_used:
+            best = selected
+            best_used = used
+    return best
+
+
+def prune_demotion_states(
+    states: list[tuple[int, float, tuple[dict, ...]]],
+    max_states: int,
+) -> list[tuple[int, float, tuple[dict, ...]]]:
+    max_states = max(1, int(max_states))
+    best_by_saved: dict[int, tuple[float, tuple[dict, ...]]] = {}
+    for saved, loss, selected in states:
+        previous = best_by_saved.get(saved)
+        if previous is None or loss < previous[0]:
+            best_by_saved[saved] = (loss, selected)
+
+    frontier: list[tuple[int, float, tuple[dict, ...]]] = []
+    best_loss = float("inf")
+    for saved in sorted(best_by_saved, reverse=True):
+        loss, selected = best_by_saved[saved]
+        if loss >= best_loss - 1e-12:
+            continue
+        frontier.append((saved, loss, selected))
+        best_loss = loss
+    frontier.sort(key=lambda item: item[0])
+
+    if len(frontier) <= max_states:
+        return frontier
+
+    keep: dict[int, tuple[int, float, tuple[dict, ...]]] = {}
+    loss_keep_count = max(1, max_states // 2)
+    for state in sorted(frontier, key=lambda item: (item[1], -item[0]))[:loss_keep_count]:
+        keep[state[0]] = state
+
+    spread_count = max_states - len(keep)
+    if spread_count > 0:
+        denom = max(1, spread_count - 1)
+        last_idx = len(frontier) - 1
+        for idx in range(spread_count):
+            state = frontier[round(idx * last_idx / denom)]
+            previous = keep.get(state[0])
+            if previous is None or state[1] < previous[1]:
+                keep[state[0]] = state
+
+    limited = sorted(keep.values(), key=lambda item: item[0])
+    if len(limited) > max_states:
+        limited = sorted(limited, key=lambda item: (item[1], -item[0]))[:max_states]
+        limited.sort(key=lambda item: item[0])
+    return limited
+
+
+def select_demotions_min_loss(
+    rows: list[dict],
+    required_saving: int,
+    max_states: int = 50_000,
+) -> list[dict]:
+    required_saving = max(0, int(required_saving))
+    if required_saving <= 0:
+        return []
+
+    options_by_group: dict[str, list[dict]] = {}
+    for row in rows:
+        saved = int(row.get("saved_bytes", 0))
+        if saved <= 0:
+            continue
+        options_by_group.setdefault(row["group"], []).append(row)
+
+    states: list[tuple[int, float, tuple[dict, ...]]] = [(0, 0.0, ())]
+    for group in sorted(options_by_group):
+        options = sorted(
+            options_by_group[group],
+            key=lambda row: (
+                float(row.get("calib_nll_loss", 0.0)),
+                -int(row.get("saved_bytes", 0)),
+                row["source"],
+            ),
+        )
+        next_states = states[:]
+        for saved, loss, selected in states:
+            for row in options:
+                next_states.append(
+                    (
+                        saved + int(row["saved_bytes"]),
+                        loss + float(row["calib_nll_loss"]),
+                        selected + (row,),
+                    )
+                )
+        states = prune_demotion_states(next_states, max_states)
+
+    feasible = [state for state in states if state[0] >= required_saving]
+    if feasible:
+        best = min(feasible, key=lambda item: (item[1], item[0]))
+        return list(best[2])
+    best = max(states, key=lambda item: (item[0], -item[1]))
+    return list(best[2])
+
+
+def select_demotions_greedy(rows: list[dict], required_saving: int) -> list[dict]:
+    required_saving = max(0, int(required_saving))
+    if required_saving <= 0:
+        return []
+    selected: list[dict] = []
+    seen_groups: set[str] = set()
+    saved = 0
+    ranked = sorted(
+        [row for row in rows if int(row.get("saved_bytes", 0)) > 0],
+        key=lambda row: (
+            float(row.get("demotion_loss_per_mbyte", 0.0)),
+            -int(row.get("saved_bytes", 0)),
+            row["source"],
+        ),
+    )
+    for row in ranked:
+        if row["group"] in seen_groups:
+            continue
+        selected.append(row)
+        seen_groups.add(row["group"])
+        saved += int(row["saved_bytes"])
+        if saved >= required_saving:
+            break
+    return selected
+
+
+def build_demotion_selection(
+    selector: str,
+    rows: list[dict],
+    required_saving: int,
+    max_states: int,
+) -> list[dict]:
+    selector = selector.strip()
+    if selector in {"reverse_knapsack", "demotion_knapsack", "knapsack"}:
+        return select_demotions_min_loss(rows, required_saving, max_states)
+    if selector in {"reverse_greedy", "demotion_greedy", "greedy"}:
+        return select_demotions_greedy(rows, required_saving)
+    raise ValueError(f"unknown demotion selector {selector!r}")
+
+
+def demotion_variant_name(selector: str, payload_bpw: float) -> str:
+    selector = selector.strip()
+    if selector in {"reverse_knapsack", "demotion_knapsack", "knapsack"}:
+        label = "reverse_knapsack"
+    elif selector in {"reverse_greedy", "demotion_greedy", "greedy"}:
+        label = "reverse_greedy"
+    else:
+        raise ValueError(f"unknown demotion selector {selector!r}")
+    return f"c2_{label}_bpw_{bpw_tag(payload_bpw)}_mixed"
+
+
+def select_random_demotions(
+    rows: list[dict],
+    required_saving: int,
+    rng: random.Random,
+    trials: int = 64,
+) -> list[dict]:
+    eligible = [row for row in rows if int(row.get("saved_bytes", 0)) > 0]
+    best: list[dict] = []
+    best_key = (-1, float("-inf"))
+    for _ in range(trials):
+        trial = eligible[:]
+        rng.shuffle(trial)
+        selected = []
+        seen_groups: set[str] = set()
+        saved = 0
+        loss = 0.0
+        for row in trial:
+            if row["group"] in seen_groups:
+                continue
+            selected.append(row)
+            seen_groups.add(row["group"])
+            saved += int(row["saved_bytes"])
+            loss += float(row.get("calib_nll_loss", 0.0))
+            if saved >= required_saving:
+                break
+        if saved >= required_saving:
+            key = (1, -loss)
+        else:
+            key = (0, saved)
+        if key > best_key:
+            best = selected
+            best_key = key
+    return best
+
+
+def selected_extra_bytes(selected: list[dict]) -> int:
+    return int(sum(row.get("extra_bytes", 0) for row in selected))
+
+
+def selected_saved_bytes(selected: list[dict]) -> int:
+    return int(sum(row.get("saved_bytes", 0) for row in selected))
+
+
+def selected_payload_bytes(base_payload: int, selected: list[dict]) -> int:
+    return int(base_payload + selected_extra_bytes(selected) - selected_saved_bytes(selected))
+
+
+def apply_selection(model, hf, readers: dict[str, dict], groups: dict[str, list[TensorSpec]], selected: list[dict]) -> None:
+    for row in selected:
+        patch_group(model, hf, readers, groups, row["group"], row["source"])
+
+
+def compact_selection(selected: list[dict]) -> list[dict]:
+    return [
+        {
+            "group": row["group"],
+            "source": row["source"],
+            "extra_bytes": int(row.get("extra_bytes", 0)),
+            "saved_bytes": int(row.get("saved_bytes", 0)),
+            "base_source": row.get("base_source"),
+            "calib_nll_improvement": float(row.get("calib_nll_improvement", 0.0)),
+            "calib_nll_loss": float(row.get("calib_nll_loss", 0.0)),
+            "calib_score_per_mbyte": float(row.get("calib_score_per_mbyte", 0.0)),
+            "weight_sse_delta": float(row.get("weight_sse_delta", 0.0)),
+            "weight_score_per_mbyte": float(row.get("weight_score_per_mbyte", 0.0)),
+            "calib_weight_rank_blend": float(row.get("calib_weight_rank_blend", 0.0)),
+            "calib_knapsack_value": float(row.get("calib_nll_improvement", 0.0)),
+            "demotion_loss_per_mbyte": float(row.get("demotion_loss_per_mbyte", 0.0)),
+        }
+        for row in selected
+    ]
+
+
+def add_byte_fields(row: dict, payload_bytes: int, total_weights: int, fp_nll: float) -> dict:
+    row["payload_bytes"] = int(payload_bytes)
+    row["payload_bpw"] = float(payload_bytes * 8 / total_weights)
+    row["delta_nll_vs_fp16"] = float(row["nll"] - fp_nll)
+    return row
+
+
+def decide(result: dict) -> tuple[str, str, str]:
+    variants = result["variants"]
+    candidate_name = result["args"].get("candidate_variant", "c2_calib_greedy_mixed")
+    candidate = variants[candidate_name]
+    target = variants[result["args"]["target_source"]]
+    high = variants[result["args"]["high_sources"][-1]]
+    target_margin = target["nll"] - candidate["nll"]
+    candidate["nll_improvement_vs_target"] = float(target_margin)
+    candidate["payload_bytes_vs_target"] = int(candidate["payload_bytes"] - target["payload_bytes"])
+    high_saving_bpw = high["payload_bpw"] - candidate["payload_bpw"]
+    candidate["payload_bpw_saving_vs_high"] = float(high_saving_bpw)
+    candidate["nll_delta_vs_high"] = float(candidate["nll"] - high["nll"])
+
+    random_control = variants.get("c2_random_same_budget")
+    weight_control = variants.get("c2_weight_mse_mixed")
+    q3ks_control = variants.get("q3_k_s")
+    if random_control is not None:
+        candidate["nll_improvement_vs_random_control"] = float(random_control["nll"] - candidate["nll"])
+    if weight_control is not None:
+        candidate["nll_improvement_vs_weight_mse_control"] = float(weight_control["nll"] - candidate["nll"])
+    if q3ks_control is not None:
+        candidate["nll_improvement_vs_q3_k_s"] = float(q3ks_control["nll"] - candidate["nll"])
+        candidate["payload_bytes_vs_q3_k_s"] = int(candidate["payload_bytes"] - q3ks_control["payload_bytes"])
+
+    selection_saved = result.get("byte_accounting", {}).get("selection_saved_bytes", {}).get(candidate_name, 0)
+    if selection_saved > 0:
+        loss_vs_target = float(candidate["nll"] - target["nll"])
+        saved_vs_target = int(target["payload_bytes"] - candidate["payload_bytes"])
+        candidate["nll_loss_vs_target"] = loss_vs_target
+        candidate["payload_bytes_saved_vs_target"] = saved_vs_target
+        max_loss = float(result["args"].get("max_shrink_nll_loss", 0.05))
+        if saved_vs_target > 0 and loss_vs_target <= max_loss:
+            return (
+                "GO",
+                "GO: reverse-demotion allocation saves tensor payload bytes while staying within the shrink-loss budget.",
+                "Evaluate the selected frontier point on public held-out datasets and materialize the smallest passing artifact.",
+            )
+        if saved_vs_target > 0:
+            return (
+                "GRAY",
+                "GRAY: reverse-demotion allocation saves bytes, but the calibration loss exceeds the shrink-loss budget.",
+                "Inspect neighboring budget points and cross-corpus public eval before promoting this operating point.",
+            )
+        return (
+            "NO-GO",
+            "NO-GO: reverse-demotion allocation did not reduce tensor payload bytes.",
+            "Use a lower payload-bpw budget or add cheaper demotion sources.",
+        )
+
+    if candidate["payload_bytes"] <= target["payload_bytes"] and target_margin >= 0.05:
+        if q3ks_control is not None and q3ks_control["nll"] - candidate["nll"] < 0.01:
+            return (
+                "GRAY",
+                "GRAY: mixed production-format allocation beats the target baseline, but does not clearly beat Q3_K_S.",
+                "Treat Q3_K_S as the blocking production control before any release claim.",
+            )
+        if random_control is not None and random_control["nll"] - candidate["nll"] < 0.01:
+            return (
+                "GRAY",
+                "GRAY: calibration-selected mixed production tensors beat the target baseline, but random same-budget allocation is too close.",
+                "Run more seeds and a page-level control before promotion.",
+            )
+        return (
+            "GO",
+            "GO: mixed production-format allocation beats the target uniform production baseline at or below its tensor payload bytes.",
+            "Escalate to three seeds and page/block-level artifact accounting.",
+        )
+    if target_margin < 0.03:
+        return (
+            "NO-GO",
+            "NO-GO: the tensor allocator does not beat the target production baseline by the predeclared margin.",
+            "Do not promote this operating point unless another selector or source set changes the premise.",
+        )
+    if high_saving_bpw >= 0.25 and candidate["nll"] <= high["nll"] + 0.03:
+        return (
+            "GO",
+            "GO: mixed production-format allocation approaches the high baseline while saving at least 0.25 bpw.",
+            "Escalate to three seeds and page/block-level artifact accounting.",
+        )
+    return (
+        "GRAY",
+        "GRAY: mixed production-format allocation improves the target baseline, but below the promotion threshold.",
+        "Run more seeds if the result is stable or points to a sharper selector.",
+    )
+
+
+def make_markdown(result: dict) -> str:
+    candidate_variant = result["args"].get("candidate_variant", "c2_calib_greedy_mixed")
+    candidate_extra_key = f"{candidate_variant}_extra_bytes"
+    selection_extra = result["byte_accounting"].get("selection_extra_bytes", {})
+    selection_saved = result["byte_accounting"].get("selection_saved_bytes", {})
+    candidate_extra = selection_extra.get(
+        candidate_variant,
+        result["byte_accounting"].get(candidate_extra_key, 0),
+    )
+    candidate_saved = selection_saved.get(candidate_variant, 0)
+    selection_base_source = result.get("selection_base_sources", {}).get(
+        candidate_variant,
+        result["args"]["low_source"],
+    )
+    lines = [
+        "# Result Card - C2 Production Mixed-Rate Transcoder Gate",
+        "",
+        "## Status",
+        "",
+        result["verdict"],
+        "",
+        "## Decisive Measurement",
+        "",
+        f"The `{result['args'].get('tensor_profile', 'qwen')}` model profile was forward-evaluated after patching real production GGUF tensor payloads. The candidate starts from the low source and promotes selected tensor groups to stronger source formats under the target tensor-payload byte budget.",
+        "",
+        "## Variants",
+        "",
+        "| Variant | NLL | Delta vs FP16 | Payload bpw | Payload bytes | Last-logit MSE | Top-10 overlap |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, row in result["variants"].items():
+        logit_mse = row.get("last_logit_mse_to_fp16")
+        overlap = row.get("top10_overlap_to_fp16")
+        lines.append(
+            f"| {name} | {row['nll']:.6f} | {row['delta_nll_vs_fp16']:.6f} | "
+            f"{row['payload_bpw']:.6f} | {row['payload_bytes']} | "
+            f"{logit_mse:.6g}" if logit_mse is not None else f"| {name} | {row['nll']:.6f} | {row['delta_nll_vs_fp16']:.6f} | {row['payload_bpw']:.6f} | {row['payload_bytes']} | n/a"
+        )
+        lines[-1] += f" | {overlap:.3f} |" if overlap is not None else " | n/a |"
+
+    lines.extend(
+        [
+            "",
+            "## Selector Summary",
+            "",
+            f"- low source: `{result['args']['low_source']}`",
+            f"- target source: `{result['args']['target_source']}`",
+            f"- high sources: `{', '.join(result['args']['high_sources'])}`",
+            f"- group mode: `{result['args']['group_mode']}`",
+            f"- tensor profile: `{result['args'].get('tensor_profile', 'qwen')}`",
+            f"- candidate variant: `{candidate_variant}`",
+            f"- selection base source: `{selection_base_source}`",
+            f"- calibration groups tested: `{len(result['allocation_rows'])}`",
+            f"- selected groups: `{len(result['selections'][candidate_variant])}`",
+            f"- selected extra bytes: `{candidate_extra}`",
+            f"- selected saved bytes: `{candidate_saved}`",
+            "",
+            "## GO / NO-GO",
+            "",
+            result["decision_text"],
+            "",
+            "## Next Step",
+            "",
+            result["next_step"],
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--hf", default=DEFAULT_HF)
+    parser.add_argument("--source", action="append", default=[], help="Production GGUF source as label=path.")
+    parser.add_argument("--low-source", default="iq3_xs")
+    parser.add_argument("--target-source", default="q3_k_m")
+    parser.add_argument("--high-sources", default="q3_k_m,iq4_xs")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--layers", default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27")
+    parser.add_argument("--group-mode", choices=["layer_family", "tensor"], default="tensor")
+    parser.add_argument("--tensor-profile", choices=["qwen", "qwen35", "gemma4", "mistral3", "granite", "olmo2", "olmo3"], default="qwen")
+    parser.add_argument("--calib-prompts", type=int, default=12)
+    parser.add_argument("--eval-prompts", type=int, default=64)
+    parser.add_argument("--calib-max-length", type=int, default=96)
+    parser.add_argument("--eval-max-length", type=int, default=128)
+    parser.add_argument("--prompt-source", choices=["synthetic", "public"], default="synthetic")
+    parser.add_argument("--dataset", default="wikitext")
+    parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
+    parser.add_argument("--text-column", default="text")
+    parser.add_argument("--calib-split", default="train")
+    parser.add_argument("--eval-split", default="validation")
+    parser.add_argument("--prompt-seed", type=int, default=None)
+    parser.add_argument("--min-tokens", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=6)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--candidate-variant", default="c2_calib_greedy_mixed")
+    parser.add_argument("--knapsack-max-states", type=int, default=50_000)
+    parser.add_argument(
+        "--sweep-payload-bpws",
+        default="",
+        help="Comma-separated payload-bpw budgets for extra promotion sweep variants.",
+    )
+    parser.add_argument(
+        "--sweep-selectors",
+        default="calib_knapsack",
+        help="Comma-separated promotion selectors for sweeps: calib_knapsack, calib_greedy, weight_mse, blend.",
+    )
+    parser.add_argument(
+        "--demotion-sources",
+        default="",
+        help="Comma-separated lower-byte sources to test by demoting from the demotion base source.",
+    )
+    parser.add_argument("--demotion-base-source", default=None)
+    parser.add_argument(
+        "--demotion-selectors",
+        default="reverse_knapsack",
+        help="Comma-separated demotion selectors for sweeps: reverse_knapsack, reverse_greedy.",
+    )
+    parser.add_argument("--max-shrink-nll-loss", type=float, default=0.05)
+    args = parser.parse_args()
+    args.layers = parse_layers(args.layers)
+    high_sources = parse_csv(args.high_sources)
+    sweep_payload_bpws = parse_float_csv(args.sweep_payload_bpws)
+    sweep_selectors = parse_csv(args.sweep_selectors)
+    demotion_sources = parse_csv(args.demotion_sources)
+    demotion_base_source = args.demotion_base_source or args.target_source
+    demotion_selectors = parse_csv(args.demotion_selectors)
+    source_paths = parse_source_specs(args.source)
+    required = {args.low_source, args.target_source, *high_sources, demotion_base_source, *demotion_sources}
+    missing = sorted(required - set(source_paths))
+    if missing:
+        raise ValueError(f"missing source paths for {missing}")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    py_rng = random.Random(args.seed)
+    print("[c2] loading tokenizer/model", flush=True)
+    device = torch.device(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    model = load_model_for_profile(args.model_dir, args.tensor_profile, device)
+
+    readers = source_readers(source_paths)
+    specs, skipped_specs = filter_specs_for_model(
+        model,
+        build_tensor_specs(args.layers, args.group_mode, args.tensor_profile),
+    )
+    specs, skipped_source_specs = filter_specs_for_sources(readers, specs)
+    skipped_specs = [*skipped_specs, *skipped_source_specs]
+    groups = group_specs(specs)
+    source_payload_bytes = payload_bytes_by_source(readers, specs)
+    if args.prompt_source == "public":
+        calib_prompts, eval_prompts, prompt_audit = build_public_prompt_split(tokenizer, args)
+    else:
+        calib_prompts, eval_prompts, prompt_audit = build_disjoint_prompt_split(
+            tokenizer,
+            args.calib_prompts,
+            args.eval_prompts,
+            args.seed + 2000,
+        )
+    print(
+        f"[c2] prompt audit split={prompt_audit['split']} overlap_count={prompt_audit['overlap_count']}",
+        flush=True,
+    )
+
+    results: dict[str, dict] = {}
+    selections: dict[str, list[dict]] = {}
+    allocation_rows: list[dict] = []
+    fp_last_logits = None
+
+    with open_hf_tensor_source(args.hf) as hf:
+        total_weights = total_weight_count(hf, model, specs)
+        print("[c2] evaluating fp16 reference", flush=True)
+        fp_eval = evaluate_model(model, tokenizer, eval_prompts, args)
+        fp_last_logits = fp_eval["captured_last_logits"]
+        results["fp16"] = add_byte_fields(strip_logits(fp_eval), total_weights * 2, total_weights, fp_eval["nll"])
+
+        print(f"[c2] patching low source {args.low_source}", flush=True)
+        patch_all_from_source(model, hf, readers, args.layers, args.low_source, args.group_mode, args.tensor_profile)
+        low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+        print(f"[c2] low-source calibration NLL: {low_calib['nll']:.6f}", flush=True)
+
+        print("[c2] scoring production-format group promotions", flush=True)
+        score_idx = 0
+        score_total = len(groups) * len(high_sources)
+        for group in groups:
+            low_bytes = group_payload_bytes(readers, groups, group, args.low_source)
+            for source in high_sources:
+                score_idx += 1
+                if score_idx == 1 or score_idx % 20 == 0 or score_idx == score_total:
+                    print(f"[c2] scoring group {score_idx}/{score_total}: {group} -> {source}", flush=True)
+                high_bytes = group_payload_bytes(readers, groups, group, source)
+                extra = high_bytes - low_bytes
+                if extra <= 0:
+                    continue
+                patch_group(model, hf, readers, groups, group, source)
+                promoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                patch_group(model, hf, readers, groups, group, args.low_source)
+                improvement = low_calib["nll"] - promoted_calib["nll"]
+                weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
+                allocation_rows.append(
+                    {
+                        "group": group,
+                        "source": source,
+                        "low_bytes": int(low_bytes),
+                        "high_bytes": int(high_bytes),
+                        "extra_bytes": int(extra),
+                        "calib_nll": float(promoted_calib["nll"]),
+                        "calib_nll_improvement": float(improvement),
+                        "calib_score_per_mbyte": float(improvement / (extra / 1_000_000)),
+                        "weight_sse_delta": float(weight_delta),
+                        "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
+                    }
+                )
+
+        demotion_rows: list[dict] = []
+        if demotion_sources:
+            print(f"[c2] patching demotion base source {demotion_base_source}", flush=True)
+            patch_all_from_source(
+                model,
+                hf,
+                readers,
+                args.layers,
+                demotion_base_source,
+                args.group_mode,
+                args.tensor_profile,
+            )
+            base_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+            print(f"[c2] demotion-base calibration NLL: {base_calib['nll']:.6f}", flush=True)
+            print("[c2] scoring production-format group demotions", flush=True)
+            demote_idx = 0
+            demote_total = len(groups) * len(demotion_sources)
+            for group in groups:
+                base_bytes = group_payload_bytes(readers, groups, group, demotion_base_source)
+                for source in demotion_sources:
+                    demote_idx += 1
+                    if demote_idx == 1 or demote_idx % 20 == 0 or demote_idx == demote_total:
+                        print(
+                            f"[c2] scoring demotion {demote_idx}/{demote_total}: {group} -> {source}",
+                            flush=True,
+                        )
+                    demoted_bytes = group_payload_bytes(readers, groups, group, source)
+                    saved = base_bytes - demoted_bytes
+                    if saved <= 0:
+                        continue
+                    patch_group(model, hf, readers, groups, group, source)
+                    demoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                    patch_group(model, hf, readers, groups, group, demotion_base_source)
+                    loss = demoted_calib["nll"] - base_calib["nll"]
+                    weight_delta = group_weight_sse_delta(
+                        hf,
+                        model,
+                        readers,
+                        groups,
+                        group,
+                        source,
+                        demotion_base_source,
+                    )
+                    demotion_rows.append(
+                        {
+                            "group": group,
+                            "source": source,
+                            "base_source": demotion_base_source,
+                            "base_bytes": int(base_bytes),
+                            "demoted_bytes": int(demoted_bytes),
+                            "extra_bytes": 0,
+                            "saved_bytes": int(saved),
+                            "calib_nll": float(demoted_calib["nll"]),
+                            "calib_nll_loss": float(loss),
+                            "demotion_loss_per_mbyte": float(loss / (saved / 1_000_000)),
+                            "weight_sse_delta": float(weight_delta),
+                            "weight_score_per_mbyte": float(weight_delta / (saved / 1_000_000)),
+                        }
+                    )
+
+        low_payload = source_payload_bytes[args.low_source]
+        target_payload = source_payload_bytes[args.target_source]
+        budget_extra = max(0, target_payload - low_payload)
+        add_rank_blend_scores(
+            allocation_rows,
+            "calib_weight_rank_blend",
+            {"calib_score_per_mbyte": 0.7, "weight_score_per_mbyte": 0.3},
+        )
+        calib_selected = select_by_score(allocation_rows, budget_extra, "calib_score_per_mbyte")
+        weight_selected = select_by_score(allocation_rows, budget_extra, "weight_score_per_mbyte")
+        blend_selected = select_by_score(allocation_rows, budget_extra, "calib_weight_rank_blend")
+        knapsack_selected = select_knapsack_by_value(
+            allocation_rows,
+            budget_extra,
+            "calib_nll_improvement",
+            args.knapsack_max_states,
+        )
+        raw_selections: dict[str, list[dict]] = {}
+        selection_base_sources: dict[str, str] = {}
+
+        def record_selection(name: str, selected: list[dict], base_source: str) -> None:
+            raw_selections[name] = selected
+            selections[name] = compact_selection(selected)
+            selection_base_sources[name] = base_source
+
+        record_selection("c2_calib_greedy_mixed", calib_selected, args.low_source)
+        record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source)
+        record_selection("c2_weight_mse_mixed", weight_selected, args.low_source)
+        record_selection("c2_calib_weight_blend_mixed", blend_selected, args.low_source)
+
+        for payload_bpw in sweep_payload_bpws:
+            payload_budget = int(math.floor(payload_bpw * total_weights / 8))
+            sweep_budget_extra = max(0, payload_budget - low_payload)
+            for selector in sweep_selectors:
+                selected = build_promotion_selection(
+                    selector,
+                    allocation_rows,
+                    sweep_budget_extra,
+                    args.knapsack_max_states,
+                )
+                record_selection(sweep_variant_name(selector, payload_bpw), selected, args.low_source)
+
+        demotion_base_payload = source_payload_bytes[demotion_base_source]
+        demotion_budget_bpws = sweep_payload_bpws or [low_payload * 8 / total_weights]
+        if demotion_rows:
+            for payload_bpw in demotion_budget_bpws:
+                payload_budget = int(math.floor(payload_bpw * total_weights / 8))
+                required_saving = max(0, demotion_base_payload - payload_budget)
+                for selector in demotion_selectors:
+                    selected = build_demotion_selection(
+                        selector,
+                        demotion_rows,
+                        required_saving,
+                        args.knapsack_max_states,
+                    )
+                    record_selection(demotion_variant_name(selector, payload_bpw), selected, demotion_base_source)
+
+        if args.candidate_variant not in raw_selections:
+            raise ValueError(f"candidate variant {args.candidate_variant!r} is not a selection variant")
+        candidate_selected = raw_selections[args.candidate_variant]
+        candidate_base_source = selection_base_sources[args.candidate_variant]
+        if selected_saved_bytes(candidate_selected) > 0:
+            random_selected = select_random_demotions(
+                demotion_rows,
+                selected_saved_bytes(candidate_selected),
+                py_rng,
+            )
+            random_base_source = candidate_base_source
+        else:
+            random_selected = select_random(
+                allocation_rows,
+                selected_extra_bytes(candidate_selected),
+                py_rng,
+            )
+            random_base_source = args.low_source
+        record_selection("c2_random_same_budget", random_selected, random_base_source)
+
+        variants_to_eval: list[tuple[str, str | None, list[dict] | None, int]] = [
+            (args.low_source, args.low_source, None, source_payload_bytes[args.low_source]),
+            (args.target_source, args.target_source, None, source_payload_bytes[args.target_source]),
+        ]
+        for source in sorted(source_paths):
+            if source not in {args.low_source, args.target_source, *high_sources}:
+                variants_to_eval.append((source, source, None, source_payload_bytes[source]))
+        for source in high_sources:
+            if source not in {args.low_source, args.target_source}:
+                variants_to_eval.append((source, source, None, source_payload_bytes[source]))
+        for name, selected in raw_selections.items():
+            base_source = selection_base_sources[name]
+            base_payload = source_payload_bytes[base_source]
+            variants_to_eval.append((name, None, selected, selected_payload_bytes(base_payload, selected)))
+
+        for name, source, selected, payload_bytes in variants_to_eval:
+            if source is not None:
+                print(f"[c2] evaluating uniform source {name}", flush=True)
+                patch_all_from_source(model, hf, readers, args.layers, source, args.group_mode, args.tensor_profile)
+            else:
+                print(f"[c2] evaluating mixed variant {name}", flush=True)
+                patch_all_from_source(
+                    model,
+                    hf,
+                    readers,
+                    args.layers,
+                    selection_base_sources[name],
+                    args.group_mode,
+                    args.tensor_profile,
+                )
+                apply_selection(model, hf, readers, groups, selected or [])
+            eval_result = evaluate_model(model, tokenizer, eval_prompts, args, fp_last_logits)
+            results[name] = add_byte_fields(strip_logits(eval_result), payload_bytes, total_weights, results["fp16"]["nll"])
+
+    serial_args = {
+        "model_dir": args.model_dir,
+        "hf": args.hf,
+        "source": {label: str(path) for label, path in source_paths.items()},
+        "low_source": args.low_source,
+        "target_source": args.target_source,
+        "high_sources": high_sources,
+        "layers": args.layers,
+        "group_mode": args.group_mode,
+        "tensor_profile": args.tensor_profile,
+        "calib_prompts": args.calib_prompts,
+        "eval_prompts": args.eval_prompts,
+        "calib_max_length": args.calib_max_length,
+        "eval_max_length": args.eval_max_length,
+        "prompt_source": args.prompt_source,
+        "dataset": args.dataset if args.prompt_source == "public" else None,
+        "dataset_config": args.dataset_config if args.prompt_source == "public" else None,
+        "text_column": args.text_column if args.prompt_source == "public" else None,
+        "calib_split": args.calib_split if args.prompt_source == "public" else None,
+        "eval_split": args.eval_split if args.prompt_source == "public" else None,
+        "prompt_seed": (args.prompt_seed if args.prompt_seed is not None else args.seed + 2000),
+        "min_tokens": args.min_tokens if args.prompt_source == "public" else None,
+        "seed": args.seed,
+        "device": args.device,
+        "candidate_variant": args.candidate_variant,
+        "knapsack_max_states": args.knapsack_max_states,
+        "sweep_payload_bpws": sweep_payload_bpws,
+        "sweep_selectors": sweep_selectors,
+        "demotion_sources": demotion_sources,
+        "demotion_base_source": demotion_base_source,
+        "demotion_selectors": demotion_selectors,
+        "max_shrink_nll_loss": args.max_shrink_nll_loss,
+    }
+    selection_extra_bytes = {name: int(selected_extra_bytes(rows)) for name, rows in raw_selections.items()}
+    selection_saved_bytes = {name: int(selected_saved_bytes(rows)) for name, rows in raw_selections.items()}
+    selection_payloads = {
+        name: int(selected_payload_bytes(source_payload_bytes[selection_base_sources[name]], rows))
+        for name, rows in raw_selections.items()
+    }
+    result = {
+        "created_utc": datetime.now(UTC).isoformat(),
+        "args": serial_args,
+        "prompt_audit": prompt_audit,
+        "source_payload_bytes": source_payload_bytes,
+        "total_weight_count": int(total_weights),
+        "skipped_model_tensors": [spec.logical_name for spec in skipped_specs],
+        "byte_accounting": {
+            "low_payload_bytes": int(low_payload),
+            "target_payload_bytes": int(target_payload),
+            "budget_extra_bytes": int(budget_extra),
+            "c2_calib_greedy_mixed_extra_bytes": int(selected_extra_bytes(calib_selected)),
+            "c2_calib_knapsack_mixed_extra_bytes": int(selected_extra_bytes(knapsack_selected)),
+            "c2_weight_mse_mixed_extra_bytes": int(selected_extra_bytes(weight_selected)),
+            "c2_calib_weight_blend_mixed_extra_bytes": int(selected_extra_bytes(blend_selected)),
+            "c2_random_same_budget_extra_bytes": int(selected_extra_bytes(random_selected)),
+            "selection_extra_bytes": selection_extra_bytes,
+            "selection_saved_bytes": selection_saved_bytes,
+            "selection_payload_bytes": selection_payloads,
+            "tag_overhead_bits_estimate": int(math.ceil(math.log2(max(2, len(source_paths)))) * len(groups)),
+        },
+        "allocation_rows": allocation_rows,
+        "demotion_rows": demotion_rows,
+        "selection_base_sources": selection_base_sources,
+        "selections": selections,
+        "variants": results,
+    }
+    status, decision_text, next_step = decide(result)
+    result["status"] = status
+    result["verdict"] = status
+    result["decision_text"] = decision_text
+    result["next_step"] = next_step
+
+    (args.output_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    (args.output_dir / "result.md").write_text(make_markdown(result), encoding="utf-8")
+    print(f"[c2] wrote {args.output_dir / 'result.md'}", flush=True)
+    print(decision_text, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
