@@ -1235,9 +1235,148 @@ def run_production_mix_configured_job(job: dict) -> dict:
     image=image,
     volumes={"/cache": cache_volume},
     gpu="H100",
-    timeout=60 * 60 * 8,
+    timeout=60 * 60 * 24,
 )
 def run_production_mix_configured_heavy_job(job: dict) -> dict:
+    return run_production_mix_configured_job.local(job)
+
+
+def _gpt_oss_heretic_base_job(
+    *,
+    seed: int,
+    eval_prompts: int,
+    calib_prompts: int,
+    calib_max_length: int,
+    eval_max_length: int,
+    result_bucket: str,
+    candidate_variant: str,
+) -> dict:
+    return {
+        "model_key": "gpt_oss_20b_heretic",
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS["gpt_oss_20b_heretic"]["layers"],
+        "group_mode": "tensor",
+        "low_source": "q2_k",
+        "target_source": "q3_k_s",
+        "high_sources": "mxfp4_moe,iq4_xs,q3_k_m,q3_k_l,q4_k_s,q4_k_m",
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": candidate_variant,
+        "knapsack_max_states": 50000,
+        "result_bucket": result_bucket,
+    }
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
+    gpu="H100",
+    timeout=60 * 60 * 24,
+)
+def run_gpt_oss_heretic_selector_bakeoff_job(
+    seed: int = 7,
+    eval_prompts: int = 192,
+    calib_prompts: int = 40,
+    calib_max_length: int = 128,
+    eval_max_length: int = 192,
+    result_bucket: str = "run_025_gpt_oss_20b_heretic_selector_bakeoff",
+) -> dict:
+    """Detached-friendly GPT-OSS 20B Heretic scored selector bakeoff on H100."""
+    job = _gpt_oss_heretic_base_job(
+        seed=seed,
+        eval_prompts=eval_prompts,
+        calib_prompts=calib_prompts,
+        calib_max_length=calib_max_length,
+        eval_max_length=eval_max_length,
+        result_bucket=result_bucket,
+        candidate_variant="c2_calib_knapsack_anneal_mixed",
+    )
+    job.update(
+        {
+            "name": (
+                "gpt_oss_20b_heretic_c2_publiccal_wikitext_wikitext-2-raw-v1_"
+                f"train_to_validation_low_q2_k_target_q3_k_s_high_mxfp4_moe_iq4_xs_q3_k_m_q3_k_l_q4_k_s_q4_k_m_"
+                f"seed_{seed}_eval_{eval_prompts}_calib_{calib_prompts}_tensor_len_{eval_max_length}_"
+                "candidate_calib_knapsack_anneal_sweep_4p62_4p80_5p00_5p20_5p45_5p70_"
+                "genetic_8x12_val8_top6_anneal_60_val8_top8"
+            ),
+            "sweep_payload_bpws": "4.62,4.80,5.00,5.20,5.45,5.70",
+            "sweep_selectors": "calib_knapsack,calib_greedy,blend",
+            "genetic_search_from": "c2_calib_knapsack_mixed",
+            "genetic_search_generations": 8,
+            "genetic_search_population": 12,
+            "genetic_search_elite": 3,
+            "genetic_search_mutation_rate": 0.18,
+            "genetic_search_validation_prompts": 8,
+            "genetic_search_rerank_top_k": 6,
+            "anneal_search_from": "c2_calib_knapsack_mixed",
+            "anneal_search_steps": 60,
+            "anneal_search_mutation_rate": 0.12,
+            "anneal_search_initial_temp": 0.03,
+            "anneal_search_final_temp": 0.001,
+            "anneal_search_validation_prompts": 8,
+            "anneal_search_rerank_top_k": 8,
+        }
+    )
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
+    gpu="H100",
+    timeout=60 * 60 * 24,
+)
+def run_gpt_oss_heretic_direct_search_job(
+    seed: int = 7,
+    eval_prompts: int = 192,
+    calib_prompts: int = 40,
+    calib_max_length: int = 128,
+    eval_max_length: int = 192,
+    result_bucket: str = "run_026_gpt_oss_20b_heretic_direct_search",
+) -> dict:
+    """Detached-friendly GPT-OSS 20B Heretic direct GA/annealing control on H100."""
+    job = _gpt_oss_heretic_base_job(
+        seed=seed,
+        eval_prompts=eval_prompts,
+        calib_prompts=calib_prompts,
+        calib_max_length=calib_max_length,
+        eval_max_length=eval_max_length,
+        result_bucket=result_bucket,
+        candidate_variant="c2_direct_anneal_mixed",
+    )
+    job.update(
+        {
+            "name": (
+                "gpt_oss_20b_heretic_c2_publiccal_wikitext_wikitext-2-raw-v1_"
+                f"train_to_validation_low_q2_k_target_q3_k_s_high_mxfp4_moe_iq4_xs_q3_k_m_q3_k_l_q4_k_s_q4_k_m_"
+                f"seed_{seed}_eval_{eval_prompts}_calib_{calib_prompts}_tensor_len_{eval_max_length}_"
+                "candidate_direct_anneal_genetic_10x16_direct_val8_top8_anneal_80_direct_val8_top8"
+            ),
+            "genetic_search_direct": True,
+            "genetic_search_generations": 10,
+            "genetic_search_population": 16,
+            "genetic_search_elite": 4,
+            "genetic_search_mutation_rate": 0.22,
+            "genetic_search_validation_prompts": 8,
+            "genetic_search_rerank_top_k": 8,
+            "anneal_search_direct": True,
+            "anneal_search_steps": 80,
+            "anneal_search_mutation_rate": 0.16,
+            "anneal_search_initial_temp": 0.035,
+            "anneal_search_final_temp": 0.001,
+            "anneal_search_validation_prompts": 8,
+            "anneal_search_rerank_top_k": 8,
+        }
+    )
     return run_production_mix_configured_job.local(job)
 
 
