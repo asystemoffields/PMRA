@@ -1234,7 +1234,7 @@ def run_production_mix_configured_job(job: dict) -> dict:
 @app.function(
     image=image,
     volumes={"/cache": cache_volume},
-    gpu="A100-80GB",
+    gpu="H100",
     timeout=60 * 60 * 8,
 )
 def run_production_mix_configured_heavy_job(job: dict) -> dict:

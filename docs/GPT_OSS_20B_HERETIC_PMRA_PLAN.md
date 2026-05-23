@@ -25,8 +25,8 @@ Local header validation against `gpt-oss-20b-heretic.Q3_K_S.gguf` matched:
 - extra GGUF tensors outside the profile: 0
 - split gate/up specs: 96
 
-This is a heavy run. Selector jobs for this model route through the 80 GB A100
-Modal path.
+This is a heavy run. Selector jobs for this model route through the H100 Modal
+path.
 
 ## First Selector Bakeoff
 
