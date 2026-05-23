@@ -1298,6 +1298,8 @@ def _gpt_oss_heretic_base_job(
     eval_max_length: int,
     result_bucket: str,
     candidate_variant: str,
+    low_source: str = "q3_k_s",
+    target_source: str = "q3_k_m",
 ) -> dict:
     return {
         "model_key": "gpt_oss_20b_heretic",
@@ -1306,8 +1308,8 @@ def _gpt_oss_heretic_base_job(
         "calib_prompts": calib_prompts,
         "layers": MODEL_CONFIGS["gpt_oss_20b_heretic"]["layers"],
         "group_mode": "tensor",
-        "low_source": "q2_k",
-        "target_source": "q3_k_s",
+        "low_source": low_source,
+        "target_source": target_source,
         "high_sources": "mxfp4_moe,iq4_xs,q3_k_m,q3_k_l,q4_k_s,q4_k_m",
         "calib_max_length": calib_max_length,
         "eval_max_length": eval_max_length,
@@ -1335,7 +1337,9 @@ def run_gpt_oss_heretic_selector_bakeoff_job(
     calib_prompts: int = 40,
     calib_max_length: int = 128,
     eval_max_length: int = 192,
-    result_bucket: str = "run_025_gpt_oss_20b_heretic_selector_bakeoff",
+    low_source: str = "q3_k_s",
+    target_source: str = "q3_k_m",
+    result_bucket: str = "run_030_gpt_oss_20b_heretic_q3ks_to_q3km_selector_bakeoff",
 ) -> dict:
     """Detached-friendly GPT-OSS 20B Heretic scored selector bakeoff on H100."""
     job = _gpt_oss_heretic_base_job(
@@ -1346,10 +1350,12 @@ def run_gpt_oss_heretic_selector_bakeoff_job(
         eval_max_length=eval_max_length,
         result_bucket=result_bucket,
         candidate_variant="c2_calib_knapsack_anneal_mixed",
+        low_source=low_source,
+        target_source=target_source,
     )
     job.update(
         {
-            "name": f"gptoss20b_heretic_bakeoff_s{seed}_e{eval_prompts}_c{calib_prompts}",
+            "name": f"gptoss20b_heretic_bakeoff_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "sweep_payload_bpws": "4.62,4.80,5.00,5.20,5.45,5.70",
             "sweep_selectors": "calib_knapsack,calib_greedy,blend",
             "genetic_search_from": "c2_calib_knapsack_mixed",
@@ -1383,7 +1389,9 @@ def run_gpt_oss_heretic_direct_search_job(
     calib_prompts: int = 40,
     calib_max_length: int = 128,
     eval_max_length: int = 192,
-    result_bucket: str = "run_026_gpt_oss_20b_heretic_direct_search",
+    low_source: str = "q3_k_s",
+    target_source: str = "q3_k_m",
+    result_bucket: str = "run_029_gpt_oss_20b_heretic_q3ks_to_q3km_direct_search",
 ) -> dict:
     """Detached-friendly GPT-OSS 20B Heretic direct GA/annealing control on H100."""
     job = _gpt_oss_heretic_base_job(
@@ -1394,10 +1402,12 @@ def run_gpt_oss_heretic_direct_search_job(
         eval_max_length=eval_max_length,
         result_bucket=result_bucket,
         candidate_variant="c2_direct_anneal_mixed",
+        low_source=low_source,
+        target_source=target_source,
     )
     job.update(
         {
-            "name": f"gptoss20b_heretic_direct_s{seed}_e{eval_prompts}_c{calib_prompts}",
+            "name": f"gptoss20b_heretic_direct_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "genetic_search_direct": True,
             "genetic_search_generations": 10,
             "genetic_search_population": 16,

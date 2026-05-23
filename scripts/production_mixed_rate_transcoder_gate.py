@@ -3077,6 +3077,12 @@ def main() -> int:
         low_payload = source_payload_bytes[args.low_source]
         target_payload = source_payload_bytes[args.target_source]
         budget_extra = max(0, target_payload - low_payload)
+        if direct_promotion_search and budget_extra <= 0:
+            raise ValueError(
+                "direct promotion search requires target payload to be larger than low payload; "
+                f"low_source={args.low_source} low_payload={low_payload} "
+                f"target_source={args.target_source} target_payload={target_payload}"
+            )
         add_rank_blend_scores(
             allocation_rows,
             "calib_weight_rank_blend",
