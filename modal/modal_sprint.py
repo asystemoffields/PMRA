@@ -1626,6 +1626,57 @@ def run_olmo_layer_selector_search_job(
 @app.function(
     image=image,
     volumes={"/cache": cache_volume},
+    gpu="A100",
+    timeout=60 * 60 * 24,
+    retries=1,
+)
+def run_olmo_reverse_demotion_job(
+    model_key: str,
+    result_bucket: str,
+    seed: int = 7,
+    eval_prompts: int = 128,
+    calib_prompts: int = 24,
+    eval_max_length: int = 128,
+    calib_max_length: int = 128,
+    payload_bpw: float = 3.45,
+) -> dict:
+    """Detached-friendly OLMo Q3_K_M shrink run using reverse demotion."""
+    bpw_label = f"{payload_bpw:.3f}".replace("-", "m").replace(".", "p")
+    job = {
+        "name": f"{model_key}_q3km_reverse_knapsack_bpw_{bpw_label}_s{seed}_e{eval_prompts}_c{calib_prompts}",
+        "model_key": model_key,
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS[model_key]["layers"],
+        "group_mode": "layer_family",
+        "low_source": "iq2_m",
+        "target_source": "iq3_xs",
+        "high_sources": "",
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": f"c2_reverse_knapsack_bpw_{bpw_label}_mixed",
+        "knapsack_max_states": 50000,
+        "sweep_payload_bpws": f"{payload_bpw:.3f}",
+        "sweep_selectors": "",
+        "demotion_base_source": "q3_k_m",
+        "demotion_sources": "iq3_xs,iq2_m,q3_k_s",
+        "demotion_selectors": "reverse_knapsack,reverse_greedy",
+        "max_shrink_nll_loss": 0.05,
+        "result_bucket": result_bucket,
+    }
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
     timeout=60 * 60,
 )
 def run_c2_artifact_job(job: dict) -> dict:

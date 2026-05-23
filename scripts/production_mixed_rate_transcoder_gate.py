@@ -2420,13 +2420,16 @@ def decide(result: dict) -> tuple[str, str, str]:
     candidate_name = result["args"].get("candidate_variant", "c2_calib_greedy_mixed")
     candidate = variants[candidate_name]
     target = variants[result["args"]["target_source"]]
-    high = variants[result["args"]["high_sources"][-1]]
+    high_sources = result["args"].get("high_sources", [])
+    high = variants[high_sources[-1]] if high_sources else None
     target_margin = target["nll"] - candidate["nll"]
     candidate["nll_improvement_vs_target"] = float(target_margin)
     candidate["payload_bytes_vs_target"] = int(candidate["payload_bytes"] - target["payload_bytes"])
-    high_saving_bpw = high["payload_bpw"] - candidate["payload_bpw"]
-    candidate["payload_bpw_saving_vs_high"] = float(high_saving_bpw)
-    candidate["nll_delta_vs_high"] = float(candidate["nll"] - high["nll"])
+    high_saving_bpw = None
+    if high is not None:
+        high_saving_bpw = high["payload_bpw"] - candidate["payload_bpw"]
+        candidate["payload_bpw_saving_vs_high"] = float(high_saving_bpw)
+        candidate["nll_delta_vs_high"] = float(candidate["nll"] - high["nll"])
 
     random_control = variants.get("c2_random_same_budget")
     weight_control = variants.get("c2_weight_mse_mixed")
@@ -2488,7 +2491,7 @@ def decide(result: dict) -> tuple[str, str, str]:
             "NO-GO: the tensor allocator does not beat the target production baseline by the predeclared margin.",
             "Do not promote this operating point unless another selector or source set changes the premise.",
         )
-    if high_saving_bpw >= 0.25 and candidate["nll"] <= high["nll"] + 0.03:
+    if high_saving_bpw is not None and high_saving_bpw >= 0.25 and candidate["nll"] <= high["nll"] + 0.03:
         return (
             "GO",
             "GO: mixed production-format allocation approaches the high baseline while saving at least 0.25 bpw.",
