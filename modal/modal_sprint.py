@@ -1677,6 +1677,60 @@ def run_olmo_reverse_demotion_job(
 @app.function(
     image=image,
     volumes={"/cache": cache_volume},
+    gpu="H100",
+    timeout=60 * 60 * 24,
+    retries=1,
+)
+def run_olmo3_reverse_demotion_frontier_h100_job(
+    result_bucket: str,
+    seed: int = 7,
+    eval_prompts: int = 128,
+    calib_prompts: int = 24,
+    eval_max_length: int = 128,
+    calib_max_length: int = 128,
+    sweep_payload_bpws: str = "3.460,3.480,3.500,3.520,3.550",
+    candidate_bpw: float = 3.50,
+) -> dict:
+    """H100 OLMo-3 Q3_K_M reverse-demotion frontier sweep."""
+    model_key = "olmo3_7b_think"
+    bpw_label = f"{candidate_bpw:.3f}".replace("-", "m").replace(".", "p")
+    source_label = "iq3_m,iq3_s,iq3_xs,q3_k_s,iq2_m,q2_k_s"
+    sweep_label = sweep_payload_bpws.replace(",", "_").replace(".", "p")
+    job = {
+        "name": f"{model_key}_q3km_reverse_frontier_sweep_{sweep_label}_candidate_{bpw_label}_s{seed}_e{eval_prompts}_c{calib_prompts}",
+        "model_key": model_key,
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS[model_key]["layers"],
+        "group_mode": "layer_family",
+        "low_source": "iq2_m",
+        "target_source": "iq3_xs",
+        "high_sources": "",
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": f"c2_reverse_knapsack_bpw_{bpw_label}_mixed",
+        "knapsack_max_states": 50000,
+        "sweep_payload_bpws": sweep_payload_bpws,
+        "sweep_selectors": "",
+        "demotion_base_source": "q3_k_m",
+        "demotion_sources": source_label,
+        "demotion_selectors": "reverse_knapsack,reverse_greedy",
+        "max_shrink_nll_loss": 0.05,
+        "result_bucket": result_bucket,
+    }
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
     timeout=60 * 60,
 )
 def run_c2_artifact_job(job: dict) -> dict:
