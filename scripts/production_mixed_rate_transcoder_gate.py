@@ -46,6 +46,7 @@ class TensorSpec:
     logical_name: str
     gguf_name: str
     group: str
+    logical_slice: str = ""
 
 
 class HFTensorSource:
@@ -165,8 +166,20 @@ def source_readers(paths: dict[str, Path]) -> dict[str, dict]:
     return readers
 
 
+SUPPORTED_TENSOR_PROFILES = {
+    "qwen",
+    "qwen35",
+    "gemma4",
+    "mistral3",
+    "granite",
+    "olmo2",
+    "olmo3",
+    "gpt_oss",
+}
+
+
 def load_model_for_profile(model_dir: str, tensor_profile: str, device: torch.device):
-    if tensor_profile not in {"qwen", "qwen35", "gemma4", "mistral3", "granite", "olmo2", "olmo3"}:
+    if tensor_profile not in SUPPORTED_TENSOR_PROFILES:
         raise ValueError(f"unknown tensor profile {tensor_profile!r}")
     model_cls = AutoModelForCausalLM
     if tensor_profile == "mistral3":
@@ -188,7 +201,7 @@ def load_model_for_profile(model_dir: str, tensor_profile: str, device: torch.de
 
 
 def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str = "qwen") -> list[TensorSpec]:
-    if tensor_profile in {"qwen", "granite", "olmo2", "olmo3"}:
+    if tensor_profile in {"qwen", "granite", "olmo2", "olmo3", "gpt_oss"}:
         specs: list[TensorSpec] = [
             TensorSpec("model.embed_tokens.weight", "token_embd.weight", "global:embed"),
             TensorSpec("lm_head.weight", "output.weight", "global:output"),
@@ -242,6 +255,53 @@ def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str =
             per_layer_group = ""
         else:
             raise ValueError(f"unknown group mode {group_mode}")
+
+        if tensor_profile == "gpt_oss":
+            attn_pairs = [
+                ("self_attn.sinks", "attn_sinks.weight", "attn_sinks"),
+                ("self_attn.q_proj.weight", "attn_q.weight", "attn_q"),
+                ("self_attn.q_proj.bias", "attn_q.bias", "attn_q_bias"),
+                ("self_attn.k_proj.weight", "attn_k.weight", "attn_k"),
+                ("self_attn.k_proj.bias", "attn_k.bias", "attn_k_bias"),
+                ("self_attn.v_proj.weight", "attn_v.weight", "attn_v"),
+                ("self_attn.v_proj.bias", "attn_v.bias", "attn_v_bias"),
+                ("self_attn.o_proj.weight", "attn_output.weight", "attn_output"),
+                ("self_attn.o_proj.bias", "attn_output.bias", "attn_output_bias"),
+            ]
+            for hf_tail, gguf_tail, short in attn_pairs:
+                group = attn_group or f"L{layer}:{short}"
+                specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+
+            mlp_pairs = [
+                ("mlp.router.weight", "ffn_gate_inp.weight", "ffn_router", ""),
+                ("mlp.router.bias", "ffn_gate_inp.bias", "ffn_router_bias", ""),
+                ("mlp.experts.gate_up_proj", "ffn_gate_exps.weight", "ffn_gate_exps", "gate"),
+                ("mlp.experts.gate_up_proj_bias", "ffn_gate_exps.bias", "ffn_gate_exps_bias", "gate"),
+                ("mlp.experts.gate_up_proj", "ffn_up_exps.weight", "ffn_up_exps", "up"),
+                ("mlp.experts.gate_up_proj_bias", "ffn_up_exps.bias", "ffn_up_exps_bias", "up"),
+                ("mlp.experts.down_proj", "ffn_down_exps.weight", "ffn_down_exps", ""),
+                ("mlp.experts.down_proj_bias", "ffn_down_exps.bias", "ffn_down_exps_bias", ""),
+            ]
+            for hf_tail, gguf_tail, short, logical_slice in mlp_pairs:
+                group = mlp_group or f"L{layer}:{short}"
+                specs.append(
+                    TensorSpec(
+                        f"{hf_prefix}.{hf_tail}",
+                        f"{gguf_prefix}.{gguf_tail}",
+                        group,
+                        logical_slice=logical_slice,
+                    )
+                )
+
+            norm_pairs = [
+                ("input_layernorm.weight", "attn_norm.weight", "attn_norm"),
+                ("post_attention_layernorm.weight", "post_attention_norm.weight", "post_attention_norm"),
+            ]
+            for hf_tail, gguf_tail, short in norm_pairs:
+                group = attn_group if short.startswith("attn") else mlp_group
+                group = group or f"L{layer}:{short}"
+                specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+            continue
 
         attn_pairs = [
             ("self_attn.q_proj.weight", "attn_q.weight", "attn_q"),
@@ -367,19 +427,47 @@ def filter_specs_for_sources(
     return kept, skipped
 
 
+def apply_logical_slice_array(array: np.ndarray, spec: TensorSpec) -> np.ndarray:
+    if not spec.logical_slice:
+        return array
+    if spec.logical_slice not in {"gate", "up"}:
+        raise ValueError(f"unknown logical slice {spec.logical_slice!r}")
+    if array.shape[-1] % 2:
+        raise ValueError(f"cannot split odd last dimension for {spec.logical_name}: {array.shape}")
+    midpoint = array.shape[-1] // 2
+    if spec.logical_slice == "gate":
+        return array[..., :midpoint]
+    return array[..., midpoint:]
+
+
+def copy_array_to_parameter_logical_slice(param: torch.nn.Parameter | torch.Tensor, array: np.ndarray, spec: TensorSpec) -> None:
+    if not spec.logical_slice:
+        copy_array_to_parameter(param, array)
+        return
+    if spec.logical_slice not in {"gate", "up"}:
+        raise ValueError(f"unknown logical slice {spec.logical_slice!r}")
+    if param.shape[-1] % 2:
+        raise ValueError(f"cannot split odd last dimension for {spec.logical_name}: {tuple(param.shape)}")
+    midpoint = param.shape[-1] // 2
+    target = param[..., :midpoint] if spec.logical_slice == "gate" else param[..., midpoint:]
+    tensor = torch.from_numpy(np.array(array, copy=True, order="C")).to(device=target.device, dtype=target.dtype)
+    with torch.no_grad():
+        target.copy_(tensor)
+
+
 def hf_ref_array(hf, model, spec: TensorSpec) -> np.ndarray:
     if spec.logical_name in hf.keys():
-        return load_hf_tensor(hf, spec.logical_name)
+        return apply_logical_slice_array(load_hf_tensor(hf, spec.logical_name), spec)
     if spec.logical_name == "lm_head.weight":
         if "lm_head.weight" in hf.keys():
-            return load_hf_tensor(hf, "lm_head.weight")
-        return model.lm_head.weight.detach().to(torch.float32).cpu().numpy()
+            return apply_logical_slice_array(load_hf_tensor(hf, "lm_head.weight"), spec)
+        return apply_logical_slice_array(model.lm_head.weight.detach().to(torch.float32).cpu().numpy(), spec)
     params = dict(model.named_parameters())
     if spec.logical_name in params:
-        return params[spec.logical_name].detach().to(torch.float32).cpu().numpy()
+        return apply_logical_slice_array(params[spec.logical_name].detach().to(torch.float32).cpu().numpy(), spec)
     buffers = dict(model.named_buffers())
     if spec.logical_name in buffers:
-        return buffers[spec.logical_name].detach().to(torch.float32).cpu().numpy()
+        return apply_logical_slice_array(buffers[spec.logical_name].detach().to(torch.float32).cpu().numpy(), spec)
     raise KeyError(f"missing HF tensor {spec.logical_name}")
 
 
@@ -389,11 +477,11 @@ def patch_tensor(model, hf, source_tensors: dict, spec: TensorSpec) -> None:
     name = spec.logical_name
     params = dict(model.named_parameters())
     if name in params:
-        copy_array_to_parameter(params[name], arr)
+        copy_array_to_parameter_logical_slice(params[name], arr, spec)
         return
     buffers = dict(model.named_buffers())
     if name in buffers:
-        copy_array_to_parameter(buffers[name], arr)
+        copy_array_to_parameter_logical_slice(buffers[name], arr, spec)
         return
     if name == "model.embed_tokens.weight":
         copy_array_to_parameter(model.model.embed_tokens.weight, arr)
@@ -945,6 +1033,12 @@ def genetic_variant_name(base_variant: str) -> str:
     return f"{base_variant}_genetic"
 
 
+def anneal_variant_name(base_variant: str) -> str:
+    if base_variant.endswith("_mixed"):
+        return f"{base_variant[:-len('_mixed')]}_anneal_mixed"
+    return f"{base_variant}_anneal"
+
+
 def infer_local_search_base_variant(candidate_variant: str) -> str:
     if candidate_variant.endswith("_local_mixed"):
         return f"{candidate_variant[:-len('_local_mixed')]}_mixed"
@@ -954,6 +1048,12 @@ def infer_local_search_base_variant(candidate_variant: str) -> str:
 def infer_genetic_search_base_variant(candidate_variant: str) -> str:
     if candidate_variant.endswith("_genetic_mixed"):
         return f"{candidate_variant[:-len('_genetic_mixed')]}_mixed"
+    return "c2_calib_knapsack_mixed"
+
+
+def infer_anneal_search_base_variant(candidate_variant: str) -> str:
+    if candidate_variant.endswith("_anneal_mixed"):
+        return f"{candidate_variant[:-len('_anneal_mixed')]}_mixed"
     return "c2_calib_knapsack_mixed"
 
 
@@ -1623,6 +1723,243 @@ def genetic_search_selection(
     return list(best["selected"]), report
 
 
+def anneal_search_selection(
+    model,
+    tokenizer,
+    hf,
+    readers: dict[str, dict],
+    groups: dict[str, list[TensorSpec]],
+    args,
+    rows: list[dict],
+    seed_selections: dict[str, list[dict]],
+    base_source: str,
+    budget_extra: int,
+    prompts: list[str],
+    rng: random.Random,
+) -> tuple[list[dict], dict]:
+    steps = max(0, int(args.anneal_search_steps))
+    mutation_rate = max(0.0, float(args.anneal_search_mutation_rate))
+    initial_temp = max(1e-9, float(args.anneal_search_initial_temp))
+    final_temp = max(1e-9, float(args.anneal_search_final_temp))
+    search_prompts, validation_prompts = split_genetic_search_prompts(
+        prompts,
+        int(getattr(args, "anneal_search_validation_prompts", 0) or 0),
+    )
+    rerank_top_k = max(0, int(getattr(args, "anneal_search_rerank_top_k", 0) or 0))
+    if validation_prompts and rerank_top_k <= 0:
+        rerank_top_k = min(8, max(1, steps))
+    cache: dict[tuple[tuple[str, str], ...], dict] = {}
+
+    print(
+        f"[c2] anneal search fitness prompts={len(search_prompts)} "
+        f"validation_prompts={len(validation_prompts)} rerank_top_k={rerank_top_k} "
+        f"steps={steps} temp={initial_temp:.6g}->{final_temp:.6g}",
+        flush=True,
+    )
+
+    def normalize(selected: list[dict]) -> list[dict]:
+        return repair_selection_to_budget(selected, budget_extra)
+
+    def evaluate(selected: list[dict]) -> dict:
+        selected = normalize(selected)
+        sig = selection_signature(selected)
+        if sig not in cache:
+            state_index = len(cache) + 1
+            print(
+                f"[c2] anneal search evaluating state {state_index}: "
+                f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
+                flush=True,
+            )
+            eval_result = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                selected,
+                prompts=search_prompts,
+                max_length=args.calib_max_length,
+            )
+            cache[sig] = {
+                "state_index": int(state_index),
+                "nll": float(eval_result["nll"]),
+                "search_nll": float(eval_result["nll"]),
+                "extra_bytes": int(selected_extra_bytes(selected)),
+                "selected": selected,
+            }
+            print(
+                f"[c2] anneal search state {state_index} nll={cache[sig]['nll']:.6f}",
+                flush=True,
+            )
+        return cache[sig]
+
+    seed_pool: list[list[dict]] = [normalize(selected) for selected in seed_selections.values()]
+    attempts = 0
+    while len(seed_pool) < 4 and attempts < 40:
+        attempts += 1
+        seed_pool.append(normalize(random_promotion_selection(rows, budget_extra, rng)))
+    if not seed_pool:
+        seed_pool = [[]]
+
+    evaluated_seeds = [evaluate(selected) for selected in seed_pool]
+    evaluated_seeds.sort(key=lambda item: (item["nll"], -item["extra_bytes"]))
+    current = evaluated_seeds[0]
+    best = evaluated_seeds[0]
+    history: list[dict] = [
+        {
+            "step": 0,
+            "temperature": float(initial_temp),
+            "current_nll": float(current["nll"]),
+            "best_nll": float(best["nll"]),
+            "current_extra_bytes": int(current["extra_bytes"]),
+            "best_extra_bytes": int(best["extra_bytes"]),
+            "accepted": True,
+            "accepted_worse": False,
+            "unique_evaluated": len(cache),
+        }
+    ]
+    accepted = 0
+    accepted_worse = 0
+
+    for step in range(1, steps + 1):
+        if steps <= 1:
+            temperature = final_temp
+        else:
+            progress = (step - 1) / max(1, steps - 1)
+            temperature = initial_temp * ((final_temp / initial_temp) ** progress)
+        candidate_selected = mutate_selection(
+            rows,
+            current["selected"],
+            budget_extra,
+            rng,
+            mutation_rate,
+        )
+        candidate = evaluate(candidate_selected)
+        delta = float(candidate["nll"] - current["nll"])
+        accept = delta <= 0.0
+        worse = False
+        if not accept:
+            threshold = math.exp(-delta / max(temperature, 1e-12))
+            accept = rng.random() < threshold
+            worse = accept
+        if accept:
+            current = candidate
+            accepted += 1
+            if worse:
+                accepted_worse += 1
+        if candidate["nll"] < best["nll"]:
+            best = candidate
+        if step == 1 or step == steps or step % max(1, steps // 10) == 0:
+            print(
+                f"[c2] anneal search step {step}/{steps} temp={temperature:.6g} "
+                f"current={current['nll']:.6f} candidate={candidate['nll']:.6f} "
+                f"best={best['nll']:.6f} accepted={accept} unique={len(cache)}",
+                flush=True,
+            )
+            history.append(
+                {
+                    "step": int(step),
+                    "temperature": float(temperature),
+                    "current_nll": float(current["nll"]),
+                    "candidate_nll": float(candidate["nll"]),
+                    "best_nll": float(best["nll"]),
+                    "current_extra_bytes": int(current["extra_bytes"]),
+                    "candidate_extra_bytes": int(candidate["extra_bytes"]),
+                    "best_extra_bytes": int(best["extra_bytes"]),
+                    "accepted": bool(accept),
+                    "accepted_worse": bool(worse),
+                    "unique_evaluated": len(cache),
+                }
+            )
+
+    search_best = best
+    validation_finalists: list[dict] = []
+    if validation_prompts:
+        finalist_count = min(max(1, rerank_top_k), len(cache))
+        validation_finalists = sorted(
+            cache.values(),
+            key=lambda item: (item["search_nll"], -item["extra_bytes"]),
+        )[:finalist_count]
+        for idx, item in enumerate(validation_finalists, start=1):
+            print(
+                f"[c2] anneal validation evaluating finalist {idx}/{len(validation_finalists)}: "
+                f"state={item['state_index']} search_nll={item['search_nll']:.6f} "
+                f"groups={len(item['selected'])} extra={item['extra_bytes']}",
+                flush=True,
+            )
+            eval_result = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                item["selected"],
+                prompts=validation_prompts,
+                max_length=args.calib_max_length,
+            )
+            item["validation_nll"] = float(eval_result["nll"])
+            print(
+                f"[c2] anneal validation finalist state={item['state_index']} "
+                f"validation_nll={item['validation_nll']:.6f}",
+                flush=True,
+            )
+        best = min(
+            validation_finalists,
+            key=lambda item: (
+                float(item.get("validation_nll", float("inf"))),
+                float(item["search_nll"]),
+                -int(item["extra_bytes"]),
+            ),
+        )
+        print(
+            f"[c2] anneal validation selected state={best['state_index']} "
+            f"validation_nll={best['validation_nll']:.6f} "
+            f"search_nll={best['search_nll']:.6f} extra={best['extra_bytes']}",
+            flush=True,
+        )
+
+    report = {
+        "final_nll": float(best["search_nll"]),
+        "final_search_nll": float(best["search_nll"]),
+        "final_validation_nll": (
+            float(best["validation_nll"]) if "validation_nll" in best else None
+        ),
+        "search_best_nll": float(search_best["search_nll"]),
+        "search_best_extra_bytes": int(search_best["extra_bytes"]),
+        "final_extra_bytes": int(best["extra_bytes"]),
+        "steps": int(steps),
+        "mutation_rate": float(mutation_rate),
+        "initial_temperature": float(initial_temp),
+        "final_temperature": float(final_temp),
+        "direct_search": bool(getattr(args, "anneal_search_direct", False)),
+        "accepted_moves": int(accepted),
+        "accepted_worse_moves": int(accepted_worse),
+        "fitness_prompt_count": int(len(search_prompts)),
+        "validation_prompt_count": int(len(validation_prompts)),
+        "validation_rerank_top_k": int(rerank_top_k),
+        "selection_metric": "validation_nll" if validation_prompts else "search_nll",
+        "evaluated_states": len(cache),
+        "validation_finalists": [
+            {
+                "state_index": int(item["state_index"]),
+                "search_nll": float(item["search_nll"]),
+                "validation_nll": (
+                    float(item["validation_nll"]) if "validation_nll" in item else None
+                ),
+                "extra_bytes": int(item["extra_bytes"]),
+                "group_count": int(len(item["selected"])),
+            }
+            for item in validation_finalists
+        ],
+        "history": history,
+    }
+    return list(best["selected"]), report
+
+
 def add_rank_blend_scores(rows: list[dict], output_key: str, weights: dict[str, float]) -> None:
     eligible = [row for row in rows if row["extra_bytes"] > 0]
     if not eligible:
@@ -2027,6 +2364,7 @@ def make_markdown(result: dict) -> str:
     )
     local_report = result.get("local_search_reports", {}).get(candidate_variant)
     genetic_report = result.get("genetic_search_reports", {}).get(candidate_variant)
+    anneal_report = result.get("anneal_search_reports", {}).get(candidate_variant)
     if genetic_report:
         lines.extend(
             [
@@ -2049,6 +2387,32 @@ def make_markdown(result: dict) -> str:
                 [
                     f"- validation final NLL: `{genetic_report['final_validation_nll']:.6f}`",
                     f"- validation rerank top-k: `{genetic_report.get('validation_rerank_top_k', 0)}`",
+                ]
+            )
+    if anneal_report:
+        lines.extend(
+            [
+                "",
+                "## Simulated Annealing",
+                "",
+                f"- base variant: `{anneal_report['base_variant']}`",
+                f"- steps: `{anneal_report['steps']}`",
+                f"- evaluated states: `{anneal_report['evaluated_states']}`",
+                f"- accepted moves: `{anneal_report['accepted_moves']}`",
+                f"- accepted worse moves: `{anneal_report['accepted_worse_moves']}`",
+                f"- temperature: `{anneal_report['initial_temperature']:.6g}` -> `{anneal_report['final_temperature']:.6g}`",
+                f"- fitness prompts: `{anneal_report.get('fitness_prompt_count', 0)}`",
+                f"- validation prompts: `{anneal_report.get('validation_prompt_count', 0)}`",
+                f"- selection metric: `{anneal_report.get('selection_metric', 'search_nll')}`",
+                f"- search final NLL: `{anneal_report.get('final_search_nll', anneal_report['final_nll']):.6f}`",
+                f"- final extra bytes: `{anneal_report['final_extra_bytes']}`",
+            ]
+        )
+        if anneal_report.get("final_validation_nll") is not None:
+            lines.extend(
+                [
+                    f"- validation final NLL: `{anneal_report['final_validation_nll']:.6f}`",
+                    f"- validation rerank top-k: `{anneal_report.get('validation_rerank_top_k', 0)}`",
                 ]
             )
     if local_report:
@@ -2097,7 +2461,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--layers", default="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27")
     parser.add_argument("--group-mode", choices=["layer_family", "tensor"], default="tensor")
-    parser.add_argument("--tensor-profile", choices=["qwen", "qwen35", "gemma4", "mistral3", "granite", "olmo2", "olmo3"], default="qwen")
+    parser.add_argument("--tensor-profile", choices=sorted(SUPPORTED_TENSOR_PROFILES), default="qwen")
     parser.add_argument("--calib-prompts", type=int, default=12)
     parser.add_argument("--eval-prompts", type=int, default=64)
     parser.add_argument("--calib-max-length", type=int, default=96)
@@ -2184,6 +2548,52 @@ def main() -> int:
         help="Number of search-best GA genomes to rerank on the reserved validation fold. Defaults to min(population, 8) when validation prompts are reserved.",
     )
     parser.add_argument(
+        "--anneal-search-from",
+        default="",
+        help="Base selection variant to seed simulated annealing.",
+    )
+    parser.add_argument(
+        "--anneal-search-steps",
+        type=int,
+        default=0,
+        help="Number of simulated-annealing mutation/evaluation steps. Disabled at 0.",
+    )
+    parser.add_argument(
+        "--anneal-search-mutation-rate",
+        type=float,
+        default=0.20,
+        help="Approximate fraction of selected groups mutated per annealing proposal.",
+    )
+    parser.add_argument(
+        "--anneal-search-initial-temp",
+        type=float,
+        default=0.02,
+        help="Initial simulated-annealing temperature in NLL units.",
+    )
+    parser.add_argument(
+        "--anneal-search-final-temp",
+        type=float,
+        default=0.001,
+        help="Final simulated-annealing temperature in NLL units.",
+    )
+    parser.add_argument(
+        "--anneal-search-direct",
+        action="store_true",
+        help="Skip per-group promotion NLL scoring and anneal whole promoted subsets directly from byte-accounted options.",
+    )
+    parser.add_argument(
+        "--anneal-search-validation-prompts",
+        type=int,
+        default=0,
+        help="Reserve this many calibration prompts as an annealing validation fold for top-state reranking.",
+    )
+    parser.add_argument(
+        "--anneal-search-rerank-top-k",
+        type=int,
+        default=0,
+        help="Number of search-best annealing states to rerank on the reserved validation fold. Defaults to min(steps, 8) when validation prompts are reserved.",
+    )
+    parser.add_argument(
         "--sweep-payload-bpws",
         default="",
         help="Comma-separated payload-bpw budgets for extra promotion sweep variants.",
@@ -2266,8 +2676,9 @@ def main() -> int:
         low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
         print(f"[c2] low-source calibration NLL: {low_calib['nll']:.6f}", flush=True)
 
-        if args.genetic_search_direct:
-            print("[c2] building direct-GA promotion options without per-group NLL scoring", flush=True)
+        direct_promotion_search = args.genetic_search_direct or args.anneal_search_direct
+        if direct_promotion_search:
+            print("[c2] building direct promotion options without per-group NLL scoring", flush=True)
             allocation_rows = build_direct_promotion_rows(readers, groups, args.low_source, high_sources)
         else:
             print("[c2] scoring production-format group promotions", flush=True)
@@ -2384,6 +2795,7 @@ def main() -> int:
         selection_base_sources: dict[str, str] = {}
         selection_extra_budgets: dict[str, int] = {}
         genetic_search_reports: dict[str, dict] = {}
+        anneal_search_reports: dict[str, dict] = {}
         local_search_reports: dict[str, dict] = {}
 
         def record_selection(
@@ -2398,7 +2810,7 @@ def main() -> int:
             if extra_budget is not None:
                 selection_extra_budgets[name] = int(extra_budget)
 
-        if not args.genetic_search_direct:
+        if not direct_promotion_search:
             record_selection("c2_calib_greedy_mixed", calib_selected, args.low_source, budget_extra)
             record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source, budget_extra)
             record_selection("c2_weight_mse_mixed", weight_selected, args.low_source, budget_extra)
@@ -2486,6 +2898,68 @@ def main() -> int:
             )
             record_selection(genetic_variant, genetic_selected, genetic_base_source, genetic_budget_extra)
             genetic_search_reports[genetic_variant] = report
+
+        if int(args.anneal_search_steps) > 0:
+            if args.anneal_search_direct:
+                anneal_base_variant = args.anneal_search_from or "direct_random_population"
+                anneal_base_source = args.low_source
+                anneal_budget_extra = budget_extra
+                anneal_variant = args.candidate_variant if args.candidate_variant.endswith("_anneal_mixed") else "c2_direct_anneal_mixed"
+                seed_variants = {
+                    name: selected
+                    for name, selected in raw_selections.items()
+                    if selection_base_sources.get(name) == anneal_base_source
+                    and selected_saved_bytes(selected) == 0
+                    and selected_extra_bytes(selected) <= anneal_budget_extra
+                }
+            else:
+                anneal_base_variant = args.anneal_search_from or infer_anneal_search_base_variant(args.candidate_variant)
+                if anneal_base_variant not in raw_selections:
+                    raise ValueError(f"anneal-search base variant {anneal_base_variant!r} is not a selection variant")
+                anneal_base_source = selection_base_sources[anneal_base_variant]
+                if anneal_base_source != args.low_source:
+                    raise ValueError("anneal search currently supports promotion selections from the low source only")
+                anneal_variant = anneal_variant_name(anneal_base_variant)
+                anneal_budget_extra = selection_extra_budgets.get(
+                    anneal_base_variant,
+                    selected_extra_bytes(raw_selections[anneal_base_variant]),
+                )
+                seed_variants = {
+                    name: selected
+                    for name, selected in raw_selections.items()
+                    if selection_base_sources.get(name) == anneal_base_source
+                    and selected_saved_bytes(selected) == 0
+                    and selected_extra_bytes(selected) <= anneal_budget_extra
+                }
+            print(
+                f"[c2] anneal search start base={anneal_base_variant} "
+                f"seeds={len(seed_variants)} budget_extra={anneal_budget_extra}",
+                flush=True,
+            )
+            anneal_selected, report = anneal_search_selection(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                allocation_rows,
+                seed_variants,
+                anneal_base_source,
+                anneal_budget_extra,
+                calib_prompts,
+                py_rng,
+            )
+            report["base_variant"] = anneal_base_variant
+            report["variant"] = anneal_variant
+            report["seed_variants"] = sorted(seed_variants)
+            report["start_extra_bytes"] = int(
+                selected_extra_bytes(raw_selections[anneal_base_variant])
+                if anneal_base_variant in raw_selections
+                else 0
+            )
+            record_selection(anneal_variant, anneal_selected, anneal_base_source, anneal_budget_extra)
+            anneal_search_reports[anneal_variant] = report
 
         if int(args.local_search_steps) > 0:
             local_base_variant = args.local_search_from or infer_local_search_base_variant(args.candidate_variant)
@@ -2611,6 +3085,14 @@ def main() -> int:
         "genetic_search_direct": args.genetic_search_direct,
         "genetic_search_validation_prompts": args.genetic_search_validation_prompts,
         "genetic_search_rerank_top_k": args.genetic_search_rerank_top_k,
+        "anneal_search_from": args.anneal_search_from,
+        "anneal_search_steps": args.anneal_search_steps,
+        "anneal_search_mutation_rate": args.anneal_search_mutation_rate,
+        "anneal_search_initial_temp": args.anneal_search_initial_temp,
+        "anneal_search_final_temp": args.anneal_search_final_temp,
+        "anneal_search_direct": args.anneal_search_direct,
+        "anneal_search_validation_prompts": args.anneal_search_validation_prompts,
+        "anneal_search_rerank_top_k": args.anneal_search_rerank_top_k,
         "sweep_payload_bpws": sweep_payload_bpws,
         "sweep_selectors": sweep_selectors,
         "demotion_sources": demotion_sources,
@@ -2649,6 +3131,7 @@ def main() -> int:
         "allocation_rows": allocation_rows,
         "demotion_rows": demotion_rows,
         "genetic_search_reports": genetic_search_reports,
+        "anneal_search_reports": anneal_search_reports,
         "local_search_reports": local_search_reports,
         "selection_base_sources": selection_base_sources,
         "selections": selections,

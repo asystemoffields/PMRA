@@ -339,6 +339,29 @@ MODEL_CONFIGS = {
             "q6_k": "Olmo-3-7B-Think.i1-Q6_K.gguf",
         },
     },
+    "gpt_oss_20b_heretic": {
+        "model_id": "p-e-w/gpt-oss-20b-heretic",
+        "model_dir": "/cache/models/gpt-oss-20b-heretic",
+        "hf_file": "/cache/models/gpt-oss-20b-heretic/model.safetensors.index.json",
+        "baseline_repo": "mradermacher/gpt-oss-20b-heretic-GGUF",
+        "tensor_profile": "gpt_oss",
+        "layers": ",".join(str(i) for i in range(24)),
+        "heavy": True,
+        "baseline_ggufs": {
+            "mxfp4_moe": "gpt-oss-20b-heretic.MXFP4_MOE.gguf",
+            "q2_k": "gpt-oss-20b-heretic.Q2_K.gguf",
+            "q3_k_s": "gpt-oss-20b-heretic.Q3_K_S.gguf",
+            "iq4_xs": "gpt-oss-20b-heretic.IQ4_XS.gguf",
+            "q3_k_m": "gpt-oss-20b-heretic.Q3_K_M.gguf",
+            "q3_k_l": "gpt-oss-20b-heretic.Q3_K_L.gguf",
+            "q4_k_s": "gpt-oss-20b-heretic.Q4_K_S.gguf",
+            "q4_k_m": "gpt-oss-20b-heretic.Q4_K_M.gguf",
+            "q5_k_s": "gpt-oss-20b-heretic.Q5_K_S.gguf",
+            "q5_k_m": "gpt-oss-20b-heretic.Q5_K_M.gguf",
+            "q6_k": "gpt-oss-20b-heretic.Q6_K.gguf",
+            "q8_0": "gpt-oss-20b-heretic.Q8_0.gguf",
+        },
+    },
     "gemma4_e2b": {
         "model_id": "google/gemma-4-E2B",
         "model_dir": "/cache/models/gemma4-e2b",
@@ -997,6 +1020,32 @@ def run_production_mix_job(job: dict) -> dict:
             )
     if bool(job.get("genetic_search_direct", False)):
         cmd.append("--genetic-search-direct")
+    if job.get("anneal_search_from", ""):
+        cmd.extend(["--anneal-search-from", job["anneal_search_from"]])
+    if int(job.get("anneal_search_steps", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--anneal-search-steps",
+                str(job["anneal_search_steps"]),
+                "--anneal-search-mutation-rate",
+                str(job.get("anneal_search_mutation_rate", 0.20)),
+                "--anneal-search-initial-temp",
+                str(job.get("anneal_search_initial_temp", 0.02)),
+                "--anneal-search-final-temp",
+                str(job.get("anneal_search_final_temp", 0.001)),
+            ]
+        )
+        if int(job.get("anneal_search_validation_prompts", 0) or 0) > 0:
+            cmd.extend(
+                [
+                    "--anneal-search-validation-prompts",
+                    str(job.get("anneal_search_validation_prompts", 0)),
+                    "--anneal-search-rerank-top-k",
+                    str(job.get("anneal_search_rerank_top_k", 0)),
+                ]
+            )
+    if bool(job.get("anneal_search_direct", False)):
+        cmd.append("--anneal-search-direct")
     if demotion_sources:
         cmd.extend(["--demotion-sources", demotion_sources])
     if job.get("demotion_base_source"):
@@ -1136,6 +1185,32 @@ def run_production_mix_configured_job(job: dict) -> dict:
             )
     if bool(job.get("genetic_search_direct", False)):
         cmd.append("--genetic-search-direct")
+    if job.get("anneal_search_from", ""):
+        cmd.extend(["--anneal-search-from", job["anneal_search_from"]])
+    if int(job.get("anneal_search_steps", 0) or 0) > 0:
+        cmd.extend(
+            [
+                "--anneal-search-steps",
+                str(job["anneal_search_steps"]),
+                "--anneal-search-mutation-rate",
+                str(job.get("anneal_search_mutation_rate", 0.20)),
+                "--anneal-search-initial-temp",
+                str(job.get("anneal_search_initial_temp", 0.02)),
+                "--anneal-search-final-temp",
+                str(job.get("anneal_search_final_temp", 0.001)),
+            ]
+        )
+        if int(job.get("anneal_search_validation_prompts", 0) or 0) > 0:
+            cmd.extend(
+                [
+                    "--anneal-search-validation-prompts",
+                    str(job.get("anneal_search_validation_prompts", 0)),
+                    "--anneal-search-rerank-top-k",
+                    str(job.get("anneal_search_rerank_top_k", 0)),
+                ]
+            )
+    if bool(job.get("anneal_search_direct", False)):
+        cmd.append("--anneal-search-direct")
     if demotion_sources:
         cmd.extend(["--demotion-sources", demotion_sources])
     if job.get("demotion_base_source"):
@@ -1154,6 +1229,16 @@ def run_production_mix_configured_job(job: dict) -> dict:
     result["target_source"] = job.get("target_source", "iq3_m")
     result["high_sources"] = high_sources
     return result
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
+    gpu="A100-80GB",
+    timeout=60 * 60 * 8,
+)
+def run_production_mix_configured_heavy_job(job: dict) -> dict:
+    return run_production_mix_configured_job.local(job)
 
 
 @app.function(
@@ -1777,6 +1862,14 @@ def phase_c2_mix(
     genetic_search_direct: bool = False,
     genetic_search_validation_prompts: int = 0,
     genetic_search_rerank_top_k: int = 0,
+    anneal_search_from: str = "",
+    anneal_search_steps: int = 0,
+    anneal_search_mutation_rate: float = 0.20,
+    anneal_search_initial_temp: float = 0.02,
+    anneal_search_final_temp: float = 0.001,
+    anneal_search_direct: bool = False,
+    anneal_search_validation_prompts: int = 0,
+    anneal_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1801,6 +1894,14 @@ def phase_c2_mix(
             frontier_suffix += f"_val{genetic_search_validation_prompts}"
             if genetic_search_rerank_top_k:
                 frontier_suffix += f"_top{genetic_search_rerank_top_k}"
+    if anneal_search_steps:
+        frontier_suffix += f"_anneal_{anneal_search_steps}"
+        if anneal_search_direct:
+            frontier_suffix += "_direct"
+        if anneal_search_validation_prompts:
+            frontier_suffix += f"_val{anneal_search_validation_prompts}"
+            if anneal_search_rerank_top_k:
+                frontier_suffix += f"_top{anneal_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1831,6 +1932,14 @@ def phase_c2_mix(
             "genetic_search_direct": genetic_search_direct,
             "genetic_search_validation_prompts": genetic_search_validation_prompts,
             "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
+            "anneal_search_from": anneal_search_from,
+            "anneal_search_steps": anneal_search_steps,
+            "anneal_search_mutation_rate": anneal_search_mutation_rate,
+            "anneal_search_initial_temp": anneal_search_initial_temp,
+            "anneal_search_final_temp": anneal_search_final_temp,
+            "anneal_search_direct": anneal_search_direct,
+            "anneal_search_validation_prompts": anneal_search_validation_prompts,
+            "anneal_search_rerank_top_k": anneal_search_rerank_top_k,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1870,6 +1979,14 @@ def phase_c2_replicate(
     genetic_search_direct: bool = False,
     genetic_search_validation_prompts: int = 0,
     genetic_search_rerank_top_k: int = 0,
+    anneal_search_from: str = "",
+    anneal_search_steps: int = 0,
+    anneal_search_mutation_rate: float = 0.20,
+    anneal_search_initial_temp: float = 0.02,
+    anneal_search_final_temp: float = 0.001,
+    anneal_search_direct: bool = False,
+    anneal_search_validation_prompts: int = 0,
+    anneal_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -1894,6 +2011,14 @@ def phase_c2_replicate(
             frontier_suffix += f"_val{genetic_search_validation_prompts}"
             if genetic_search_rerank_top_k:
                 frontier_suffix += f"_top{genetic_search_rerank_top_k}"
+    if anneal_search_steps:
+        frontier_suffix += f"_anneal_{anneal_search_steps}"
+        if anneal_search_direct:
+            frontier_suffix += "_direct"
+        if anneal_search_validation_prompts:
+            frontier_suffix += f"_val{anneal_search_validation_prompts}"
+            if anneal_search_rerank_top_k:
+                frontier_suffix += f"_top{anneal_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -1926,6 +2051,14 @@ def phase_c2_replicate(
             "genetic_search_direct": genetic_search_direct,
             "genetic_search_validation_prompts": genetic_search_validation_prompts,
             "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
+            "anneal_search_from": anneal_search_from,
+            "anneal_search_steps": anneal_search_steps,
+            "anneal_search_mutation_rate": anneal_search_mutation_rate,
+            "anneal_search_initial_temp": anneal_search_initial_temp,
+            "anneal_search_final_temp": anneal_search_final_temp,
+            "anneal_search_direct": anneal_search_direct,
+            "anneal_search_validation_prompts": anneal_search_validation_prompts,
+            "anneal_search_rerank_top_k": anneal_search_rerank_top_k,
             "sweep_payload_bpws": sweep_payload_bpws,
             "sweep_selectors": sweep_selectors,
             "demotion_sources": demotion_sources,
@@ -1936,7 +2069,12 @@ def phase_c2_replicate(
         }
         for seed in seed_values
     ]
-    for result in run_production_mix_configured_job.map(jobs):
+    runner = (
+        run_production_mix_configured_heavy_job
+        if any(MODEL_CONFIGS[job["model_key"]].get("heavy") for job in jobs)
+        else run_production_mix_configured_job
+    )
+    for result in runner.map(jobs):
         print(json.dumps(result, indent=2))
 
 
@@ -2012,6 +2150,14 @@ def phase_c2_public_calibrated(
     genetic_search_direct: bool = False,
     genetic_search_validation_prompts: int = 0,
     genetic_search_rerank_top_k: int = 0,
+    anneal_search_from: str = "",
+    anneal_search_steps: int = 0,
+    anneal_search_mutation_rate: float = 0.20,
+    anneal_search_initial_temp: float = 0.02,
+    anneal_search_final_temp: float = 0.001,
+    anneal_search_direct: bool = False,
+    anneal_search_validation_prompts: int = 0,
+    anneal_search_rerank_top_k: int = 0,
     sweep_payload_bpws: str = "",
     sweep_selectors: str = "calib_knapsack",
     demotion_sources: str = "",
@@ -2036,6 +2182,14 @@ def phase_c2_public_calibrated(
             frontier_suffix += f"_val{genetic_search_validation_prompts}"
             if genetic_search_rerank_top_k:
                 frontier_suffix += f"_top{genetic_search_rerank_top_k}"
+    if anneal_search_steps:
+        frontier_suffix += f"_anneal_{anneal_search_steps}"
+        if anneal_search_direct:
+            frontier_suffix += "_direct"
+        if anneal_search_validation_prompts:
+            frontier_suffix += f"_val{anneal_search_validation_prompts}"
+            if anneal_search_rerank_top_k:
+                frontier_suffix += f"_top{anneal_search_rerank_top_k}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = []
@@ -2080,6 +2234,14 @@ def phase_c2_public_calibrated(
                 "genetic_search_direct": genetic_search_direct,
                 "genetic_search_validation_prompts": genetic_search_validation_prompts,
                 "genetic_search_rerank_top_k": genetic_search_rerank_top_k,
+                "anneal_search_from": anneal_search_from,
+                "anneal_search_steps": anneal_search_steps,
+                "anneal_search_mutation_rate": anneal_search_mutation_rate,
+                "anneal_search_initial_temp": anneal_search_initial_temp,
+                "anneal_search_final_temp": anneal_search_final_temp,
+                "anneal_search_direct": anneal_search_direct,
+                "anneal_search_validation_prompts": anneal_search_validation_prompts,
+                "anneal_search_rerank_top_k": anneal_search_rerank_top_k,
                 "sweep_payload_bpws": sweep_payload_bpws,
                 "sweep_selectors": sweep_selectors,
                 "demotion_sources": demotion_sources,
@@ -2089,7 +2251,12 @@ def phase_c2_public_calibrated(
                 "result_bucket": result_bucket,
             }
         )
-    for result in run_production_mix_configured_job.map(jobs):
+    runner = (
+        run_production_mix_configured_heavy_job
+        if any(MODEL_CONFIGS[job["model_key"]].get("heavy") for job in jobs)
+        else run_production_mix_configured_job
+    )
+    for result in runner.map(jobs):
         print(json.dumps(result, indent=2))
 
 

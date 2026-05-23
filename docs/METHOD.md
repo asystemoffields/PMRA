@@ -72,6 +72,8 @@ The Granite 4.1 8B Heretic release is a completed `granite` profile example:
    - greedy ratio selector for the earlier Qwen mix
    - exact scaled multiple-choice knapsack when the byte budget is compact
    - Pareto-pruned knapsack frontier when the exact state space is larger
+   - optional genetic search and simulated annealing refinements around scored
+     candidates, plus direct search controls that skip per-tensor scoring
 6. Evaluate the resulting full mix on held-out prompts.
 7. Compare against:
    - target uniform source

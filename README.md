@@ -67,6 +67,11 @@ practical. The selected mix still has to pass held-out evaluation because tensor
 interactions are real and calibration is the selection objective, not the final
 claim.
 
+The repo also supports search refinements around that default: seeded genetic
+search, direct genetic search, seeded simulated annealing, and direct simulated
+annealing. These are tested as candidate finders, then judged by the same
+held-out controls as knapsack.
+
 ## Prior Art And Positioning
 
 PMRA is new in this repo as a GGUF-native mixing workflow, but it sits inside a

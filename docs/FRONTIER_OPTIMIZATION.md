@@ -12,8 +12,12 @@ The C2 gate now supports two frontier modes:
   payloads under several payload-bpw budgets
 - reverse-demotion sweeps: start from a base source and demote selected tensor
   groups to cheaper sources with minimum calibration loss
+- genetic search: cross over and mutate selected promotion sets, either seeded
+  from scored candidates or run directly from byte-accounted options
+- simulated annealing: mutate selected promotion sets with a cooling schedule,
+  either seeded from scored candidates or run directly
 
-Both modes write normal `selections` entries in `result.json`. Each mixed
+These modes write normal `selections` entries in `result.json`. Each mixed
 selection also has a `selection_base_sources` entry, so artifact building and
 public evaluation know which source fills unselected tensors.
 

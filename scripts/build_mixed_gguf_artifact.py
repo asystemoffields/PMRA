@@ -14,7 +14,7 @@ import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter
 
 from activation_conditioned_scale_mirage import parse_layers
-from production_mixed_rate_transcoder_gate import build_tensor_specs, group_specs
+from production_mixed_rate_transcoder_gate import SUPPORTED_TENSOR_PROFILES, build_tensor_specs, group_specs
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="backslashreplace")
@@ -235,7 +235,7 @@ def main() -> int:
     parser.add_argument("--metadata-source", default=None)
     parser.add_argument("--layers", default=None)
     parser.add_argument("--group-mode", default=None)
-    parser.add_argument("--tensor-profile", default=None, choices=["qwen", "qwen35", "gemma4", "mistral3", "granite", "olmo2", "olmo3"])
+    parser.add_argument("--tensor-profile", default=None, choices=sorted(SUPPORTED_TENSOR_PROFILES))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
