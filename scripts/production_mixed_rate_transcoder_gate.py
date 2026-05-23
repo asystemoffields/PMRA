@@ -205,6 +205,38 @@ def prompt_digest(prompts: list[str]) -> str:
     return digest.hexdigest()[:16]
 
 
+def selection_rows_digest(rows: list[dict]) -> str:
+    keys = (
+        "group",
+        "source",
+        "extra_bytes",
+        "saved_bytes",
+        "low_bytes",
+        "high_bytes",
+        "base_bytes",
+        "demoted_bytes",
+        "calib_nll_improvement",
+        "calib_nll_loss",
+    )
+    payload = [
+        {key: row[key] for key in keys if key in row}
+        for row in sorted(rows, key=lambda item: (str(item.get("group", "")), str(item.get("source", ""))))
+    ]
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def selection_search_context(base_context: dict, args, rows: list[dict]) -> dict:
+    return {
+        **base_context,
+        "group_mode": str(getattr(args, "group_mode", "")),
+        "layers": [int(layer) for layer in (getattr(args, "layers", []) or [])],
+        "source_labels": sorted({str(row.get("source", "")) for row in rows}),
+        "eligible_row_count": int(len(rows)),
+        "eligible_rows_digest": selection_rows_digest(rows),
+    }
+
+
 def clean_checkpoint_row(row: dict) -> dict:
     clean = dict(row)
     clean.pop("_checkpoint_context", None)
@@ -257,10 +289,11 @@ def write_fp16_checkpoint(checkpoint_dir: Path, context: dict, result: dict) -> 
     )
 
 
-def load_selection_search_cache(path: Path, index_key: str, context: dict) -> dict[tuple[tuple[str, str], ...], dict]:
+def load_selection_search_cache(path: Path, index_key: str, context: dict | list[dict]) -> dict[tuple[tuple[str, str], ...], dict]:
+    contexts = context if isinstance(context, list) else [context]
     cache: dict[tuple[tuple[str, str], ...], dict] = {}
     for row in load_jsonl_rows(path):
-        if row.get("context") != context:
+        if row.get("context") not in contexts:
             continue
         selected = row.get("selected") or []
         if row.get("signature") is not None:
@@ -1355,7 +1388,7 @@ def local_search_repair_selection(
     if selected_saved_bytes(start_selected) > 0:
         raise ValueError("local search currently supports promotion selections only")
 
-    cache_context = {
+    base_cache_context = {
         "kind": "local_search",
         "base_source": base_source,
         "budget_extra": int(budget_extra),
@@ -1364,8 +1397,9 @@ def local_search_repair_selection(
         "tensor_profile": str(args.tensor_profile),
         "group_mode": str(args.group_mode),
     }
+    cache_context = selection_search_context(base_cache_context, args, rows)
     cache_path = args.output_dir / "checkpoints" / "local_search_fitness.jsonl"
-    cache = load_selection_search_cache(cache_path, "candidate_index", cache_context)
+    cache = load_selection_search_cache(cache_path, "candidate_index", [cache_context, base_cache_context])
 
     def evaluate_cached(selected: list[dict], label: str) -> dict:
         sig = selection_signature(selected)
@@ -1670,7 +1704,7 @@ def genetic_search_selection(
     rerank_top_k = max(0, int(getattr(args, "genetic_search_rerank_top_k", 0) or 0))
     if validation_prompts and rerank_top_k <= 0:
         rerank_top_k = min(population_size, 8)
-    cache_context = {
+    base_cache_context = {
         "kind": "genetic",
         "base_source": base_source,
         "budget_extra": int(budget_extra),
@@ -1680,8 +1714,9 @@ def genetic_search_selection(
         "max_length": int(args.calib_max_length),
         "tensor_profile": str(args.tensor_profile),
     }
+    cache_context = selection_search_context(base_cache_context, args, rows)
     cache_path = args.output_dir / "checkpoints" / "genetic_search_fitness.jsonl"
-    cache = load_selection_search_cache(cache_path, "genome_index", cache_context)
+    cache = load_selection_search_cache(cache_path, "genome_index", [cache_context, base_cache_context])
 
     print(
         f"[c2] genetic search fitness prompts={len(search_prompts)} "
@@ -1932,7 +1967,7 @@ def anneal_search_selection(
     rerank_top_k = max(0, int(getattr(args, "anneal_search_rerank_top_k", 0) or 0))
     if validation_prompts and rerank_top_k <= 0:
         rerank_top_k = min(8, max(1, steps))
-    cache_context = {
+    base_cache_context = {
         "kind": "anneal",
         "base_source": base_source,
         "budget_extra": int(budget_extra),
@@ -1942,8 +1977,9 @@ def anneal_search_selection(
         "max_length": int(args.calib_max_length),
         "tensor_profile": str(args.tensor_profile),
     }
+    cache_context = selection_search_context(base_cache_context, args, rows)
     cache_path = args.output_dir / "checkpoints" / "anneal_search_fitness.jsonl"
-    cache = load_selection_search_cache(cache_path, "state_index", cache_context)
+    cache = load_selection_search_cache(cache_path, "state_index", [cache_context, base_cache_context])
 
     print(
         f"[c2] anneal search fitness prompts={len(search_prompts)} "
