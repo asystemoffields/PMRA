@@ -501,8 +501,24 @@ def _run(cmd: list[str], cwd: str = "/workspace") -> None:
 
 
 def _run_and_commit(cmd: list[str], cwd: str = "/workspace") -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/workspace/scripts:" + env.get("PYTHONPATH", "")
+    print("[modal-sprint] " + " ".join(cmd), flush=True)
+    process = subprocess.Popen(cmd, cwd=cwd, env=env)
     try:
-        _run(cmd, cwd)
+        while True:
+            try:
+                return_code = process.wait(timeout=300)
+                break
+            except subprocess.TimeoutExpired:
+                try:
+                    cache_volume.commit()
+                    print("[modal-sprint] committed cache volume checkpoint", flush=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[modal-sprint] cache volume checkpoint failed: {exc}", flush=True)
+
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, cmd)
     finally:
         cache_volume.commit()
 
