@@ -1868,6 +1868,16 @@ def run_pmra_public_eval_job(job: dict) -> dict:
     return result
 
 
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
+    gpu="H100",
+    timeout=60 * 60 * 3,
+)
+def run_pmra_public_eval_h100_job(job: dict) -> dict:
+    return run_pmra_public_eval_job.local(job)
+
+
 def _run_pmra_code_likelihood_inline(job: dict) -> dict:
     model_key = job.get("model_key", "gemma4_e2b_it")
     config = MODEL_CONFIGS[model_key]
@@ -2645,6 +2655,7 @@ def phase_c2_public_eval(
     result_bucket: str = "run_008_c2_subq3_iq2m_to_iq3xs_calib48_eval1024",
     result_name: str = "",
     public_bucket: str = "run_008_pmra_public_eval",
+    h100: bool = False,
 ):
     """Evaluate an existing PMRA selection on a separate public HF dataset."""
     dataset_config_value = None if dataset_config.lower() in {"", "none", "null"} else dataset_config
@@ -2673,7 +2684,8 @@ def phase_c2_public_eval(
         "result_name": result_name or None,
         "public_bucket": public_bucket,
     }
-    print(json.dumps(run_pmra_public_eval_job.remote(job), indent=2))
+    runner = run_pmra_public_eval_h100_job if h100 else run_pmra_public_eval_job
+    print(json.dumps(runner.remote(job), indent=2))
 
 
 @app.local_entrypoint()
