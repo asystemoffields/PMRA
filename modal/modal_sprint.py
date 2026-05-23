@@ -1450,6 +1450,73 @@ def run_olmo_reverse_frontier_job(
 @app.function(
     image=image,
     volumes={"/cache": cache_volume},
+    gpu="A100",
+    timeout=60 * 60 * 8,
+)
+def run_olmo_tensor_direct_search_job(
+    model_key: str,
+    result_bucket: str,
+    seed: int = 7,
+    eval_prompts: int = 128,
+    calib_prompts: int = 40,
+    eval_max_length: int = 128,
+    calib_max_length: int = 128,
+) -> dict:
+    """Detached-friendly OLMo tensor-level direct GA/annealing search."""
+    group_mode = "tensor"
+    low_source = "iq2_m"
+    target_source = "iq3_xs"
+    high_sources = "q2_k_s,q2_k,q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_s"
+    candidate_variant = "c2_direct_anneal_mixed"
+    job = {
+        "name": (
+            f"{model_key}_c2_publiccal_wikitext_wikitext-2-raw-v1_"
+            f"train_to_validation_low_{low_source}_target_{target_source}_"
+            f"high_{high_sources.replace(',', '_')}_seed_{seed}_eval_{eval_prompts}_"
+            f"calib_{calib_prompts}_{group_mode}_len_{eval_max_length}_"
+            "candidate_direct_anneal_genetic_8x16_direct_val8_top8_anneal_96_direct_val8_top8"
+        ),
+        "model_key": model_key,
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS[model_key]["layers"],
+        "group_mode": group_mode,
+        "low_source": low_source,
+        "target_source": target_source,
+        "high_sources": high_sources,
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": candidate_variant,
+        "knapsack_max_states": 50000,
+        "genetic_search_direct": True,
+        "genetic_search_generations": 8,
+        "genetic_search_population": 16,
+        "genetic_search_elite": 4,
+        "genetic_search_mutation_rate": 0.22,
+        "genetic_search_validation_prompts": 8,
+        "genetic_search_rerank_top_k": 8,
+        "anneal_search_direct": True,
+        "anneal_search_steps": 96,
+        "anneal_search_mutation_rate": 0.16,
+        "anneal_search_initial_temp": 0.035,
+        "anneal_search_final_temp": 0.001,
+        "anneal_search_validation_prompts": 8,
+        "anneal_search_rerank_top_k": 8,
+        "result_bucket": result_bucket,
+    }
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
     timeout=60 * 60,
 )
 def run_c2_artifact_job(job: dict) -> dict:
