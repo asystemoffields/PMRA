@@ -2457,6 +2457,7 @@ def phase_c2_artifact(
     artifact_name: str = "",
     output_gguf: str = "",
     artifact_bucket: str = "run_007_c2_mixed_gguf_artifact",
+    metadata_source: str = "",
 ):
     """Build a loadable mixed GGUF artifact from a completed C2 allocation result."""
     default_result_name = (
@@ -2470,7 +2471,7 @@ def phase_c2_artifact(
         "name": artifact_name or _safe_path_component(f"{result_name}_{variant_suffix}_artifact"),
         "result_json": result_json,
         "variant": variant,
-        "metadata_source": low_source,
+        "metadata_source": metadata_source or low_source,
         "target_source": target_source,
         "high_sources": high_sources,
         "artifact_bucket": artifact_bucket,
