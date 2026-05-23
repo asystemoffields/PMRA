@@ -1284,6 +1284,7 @@ def run_production_mix_configured_job(job: dict) -> dict:
     volumes={"/cache": cache_volume},
     gpu="H100",
     timeout=60 * 60 * 24,
+    retries=1,
 )
 def run_production_mix_configured_heavy_job(job: dict) -> dict:
     return run_production_mix_configured_job.local(job)
@@ -1300,6 +1301,8 @@ def _gpt_oss_heretic_base_job(
     candidate_variant: str,
     low_source: str = "q3_k_s",
     target_source: str = "q3_k_m",
+    group_mode: str = "layer_family",
+    high_sources: str = "mxfp4_moe,iq4_xs,q3_k_m,q3_k_l",
 ) -> dict:
     return {
         "model_key": "gpt_oss_20b_heretic",
@@ -1307,10 +1310,10 @@ def _gpt_oss_heretic_base_job(
         "eval_prompts": eval_prompts,
         "calib_prompts": calib_prompts,
         "layers": MODEL_CONFIGS["gpt_oss_20b_heretic"]["layers"],
-        "group_mode": "tensor",
+        "group_mode": group_mode,
         "low_source": low_source,
         "target_source": target_source,
-        "high_sources": "mxfp4_moe,iq4_xs,q3_k_m,q3_k_l,q4_k_s,q4_k_m",
+        "high_sources": high_sources,
         "calib_max_length": calib_max_length,
         "eval_max_length": eval_max_length,
         "prompt_source": "public",
@@ -1330,18 +1333,19 @@ def _gpt_oss_heretic_base_job(
     volumes={"/cache": cache_volume},
     gpu="H100",
     timeout=60 * 60 * 24,
+    retries=1,
 )
 def run_gpt_oss_heretic_selector_bakeoff_job(
     seed: int = 7,
-    eval_prompts: int = 192,
-    calib_prompts: int = 40,
+    eval_prompts: int = 128,
+    calib_prompts: int = 24,
     calib_max_length: int = 128,
     eval_max_length: int = 192,
     low_source: str = "q3_k_s",
     target_source: str = "q3_k_m",
-    result_bucket: str = "run_030_gpt_oss_20b_heretic_q3ks_to_q3km_selector_bakeoff",
+    result_bucket: str = "run_031_gpt_oss_20b_heretic_q3ks_to_q3km_layer_selector_bakeoff",
 ) -> dict:
-    """Detached-friendly GPT-OSS 20B Heretic scored selector bakeoff on H100."""
+    """Detached-friendly GPT-OSS 20B Heretic layer-family selector bakeoff on H100."""
     job = _gpt_oss_heretic_base_job(
         seed=seed,
         eval_prompts=eval_prompts,
@@ -1355,23 +1359,22 @@ def run_gpt_oss_heretic_selector_bakeoff_job(
     )
     job.update(
         {
-            "name": f"gptoss20b_heretic_bakeoff_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
-            "sweep_payload_bpws": "4.62,4.80,5.00,5.20,5.45,5.70",
+            "name": f"gptoss20b_heretic_layer_selector_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "sweep_selectors": "calib_knapsack,calib_greedy,blend",
             "genetic_search_from": "c2_calib_knapsack_mixed",
-            "genetic_search_generations": 8,
-            "genetic_search_population": 12,
+            "genetic_search_generations": 5,
+            "genetic_search_population": 10,
             "genetic_search_elite": 3,
             "genetic_search_mutation_rate": 0.18,
-            "genetic_search_validation_prompts": 8,
+            "genetic_search_validation_prompts": 6,
             "genetic_search_rerank_top_k": 6,
             "anneal_search_from": "c2_calib_knapsack_mixed",
-            "anneal_search_steps": 60,
+            "anneal_search_steps": 40,
             "anneal_search_mutation_rate": 0.12,
             "anneal_search_initial_temp": 0.03,
             "anneal_search_final_temp": 0.001,
-            "anneal_search_validation_prompts": 8,
-            "anneal_search_rerank_top_k": 8,
+            "anneal_search_validation_prompts": 6,
+            "anneal_search_rerank_top_k": 6,
         }
     )
     return run_production_mix_configured_job.local(job)
@@ -1382,18 +1385,19 @@ def run_gpt_oss_heretic_selector_bakeoff_job(
     volumes={"/cache": cache_volume},
     gpu="H100",
     timeout=60 * 60 * 24,
+    retries=1,
 )
 def run_gpt_oss_heretic_direct_search_job(
     seed: int = 7,
-    eval_prompts: int = 192,
-    calib_prompts: int = 40,
+    eval_prompts: int = 128,
+    calib_prompts: int = 24,
     calib_max_length: int = 128,
     eval_max_length: int = 192,
     low_source: str = "q3_k_s",
     target_source: str = "q3_k_m",
-    result_bucket: str = "run_029_gpt_oss_20b_heretic_q3ks_to_q3km_direct_search",
+    result_bucket: str = "run_032_gpt_oss_20b_heretic_q3ks_to_q3km_layer_direct_search",
 ) -> dict:
-    """Detached-friendly GPT-OSS 20B Heretic direct GA/annealing control on H100."""
+    """Detached-friendly GPT-OSS 20B Heretic layer-family direct GA/annealing control on H100."""
     job = _gpt_oss_heretic_base_job(
         seed=seed,
         eval_prompts=eval_prompts,
@@ -1407,21 +1411,21 @@ def run_gpt_oss_heretic_direct_search_job(
     )
     job.update(
         {
-            "name": f"gptoss20b_heretic_direct_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
+            "name": f"gptoss20b_heretic_layer_direct_{low_source}_to_{target_source}_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "genetic_search_direct": True,
-            "genetic_search_generations": 10,
-            "genetic_search_population": 16,
-            "genetic_search_elite": 4,
+            "genetic_search_generations": 5,
+            "genetic_search_population": 10,
+            "genetic_search_elite": 3,
             "genetic_search_mutation_rate": 0.22,
-            "genetic_search_validation_prompts": 8,
-            "genetic_search_rerank_top_k": 8,
+            "genetic_search_validation_prompts": 6,
+            "genetic_search_rerank_top_k": 6,
             "anneal_search_direct": True,
-            "anneal_search_steps": 80,
+            "anneal_search_steps": 40,
             "anneal_search_mutation_rate": 0.16,
             "anneal_search_initial_temp": 0.035,
             "anneal_search_final_temp": 0.001,
-            "anneal_search_validation_prompts": 8,
-            "anneal_search_rerank_top_k": 8,
+            "anneal_search_validation_prompts": 6,
+            "anneal_search_rerank_top_k": 6,
         }
     )
     return run_production_mix_configured_job.local(job)
@@ -1498,7 +1502,8 @@ def run_olmo_reverse_frontier_job(
     image=image,
     volumes={"/cache": cache_volume},
     gpu="A100",
-    timeout=60 * 60 * 8,
+    timeout=60 * 60 * 24,
+    retries=1,
 )
 def run_olmo_tensor_direct_search_job(
     model_key: str,
@@ -1509,14 +1514,14 @@ def run_olmo_tensor_direct_search_job(
     eval_max_length: int = 128,
     calib_max_length: int = 128,
 ) -> dict:
-    """Detached-friendly OLMo tensor-level direct GA/annealing search."""
-    group_mode = "tensor"
+    """Detached-friendly OLMo layer-family direct GA/annealing search."""
+    group_mode = "layer_family"
     low_source = "iq2_m"
     target_source = "iq3_xs"
     high_sources = "q2_k_s,q2_k,q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_s"
     candidate_variant = "c2_direct_anneal_mixed"
     job = {
-        "name": f"{model_key}_tensor_direct_s{seed}_e{eval_prompts}_c{calib_prompts}",
+        "name": f"{model_key}_layer_direct_s{seed}_e{eval_prompts}_c{calib_prompts}",
         "model_key": model_key,
         "seed": seed,
         "eval_prompts": eval_prompts,
@@ -1537,19 +1542,82 @@ def run_olmo_tensor_direct_search_job(
         "candidate_variant": candidate_variant,
         "knapsack_max_states": 50000,
         "genetic_search_direct": True,
-        "genetic_search_generations": 8,
-        "genetic_search_population": 16,
-        "genetic_search_elite": 4,
+        "genetic_search_generations": 5,
+        "genetic_search_population": 10,
+        "genetic_search_elite": 3,
         "genetic_search_mutation_rate": 0.22,
-        "genetic_search_validation_prompts": 8,
-        "genetic_search_rerank_top_k": 8,
+        "genetic_search_validation_prompts": 6,
+        "genetic_search_rerank_top_k": 6,
         "anneal_search_direct": True,
-        "anneal_search_steps": 96,
+        "anneal_search_steps": 40,
         "anneal_search_mutation_rate": 0.16,
         "anneal_search_initial_temp": 0.035,
         "anneal_search_final_temp": 0.001,
-        "anneal_search_validation_prompts": 8,
-        "anneal_search_rerank_top_k": 8,
+        "anneal_search_validation_prompts": 6,
+        "anneal_search_rerank_top_k": 6,
+        "result_bucket": result_bucket,
+    }
+    return run_production_mix_configured_job.local(job)
+
+
+@app.function(
+    image=image,
+    volumes={"/cache": cache_volume},
+    gpu="A100",
+    timeout=60 * 60 * 24,
+    retries=1,
+)
+def run_olmo_layer_selector_search_job(
+    model_key: str,
+    result_bucket: str,
+    seed: int = 7,
+    eval_prompts: int = 128,
+    calib_prompts: int = 24,
+    eval_max_length: int = 128,
+    calib_max_length: int = 128,
+) -> dict:
+    """Detached-friendly OLMo layer-family selector/GA/annealing search."""
+    group_mode = "layer_family"
+    low_source = "iq2_m"
+    target_source = "iq3_xs"
+    high_sources = "q3_k_s,q3_k_m,iq4_xs"
+    candidate_variant = "c2_calib_knapsack_anneal_mixed"
+    job = {
+        "name": f"{model_key}_layer_selector_s{seed}_e{eval_prompts}_c{calib_prompts}",
+        "model_key": model_key,
+        "seed": seed,
+        "eval_prompts": eval_prompts,
+        "calib_prompts": calib_prompts,
+        "layers": MODEL_CONFIGS[model_key]["layers"],
+        "group_mode": group_mode,
+        "low_source": low_source,
+        "target_source": target_source,
+        "high_sources": high_sources,
+        "calib_max_length": calib_max_length,
+        "eval_max_length": eval_max_length,
+        "prompt_source": "public",
+        "dataset": "wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "calib_split": "train",
+        "eval_split": "validation",
+        "prompt_seed": 2701,
+        "candidate_variant": candidate_variant,
+        "knapsack_max_states": 50000,
+        "sweep_selectors": "calib_knapsack,calib_greedy,blend",
+        "genetic_search_from": "c2_calib_knapsack_mixed",
+        "genetic_search_generations": 5,
+        "genetic_search_population": 10,
+        "genetic_search_elite": 3,
+        "genetic_search_mutation_rate": 0.18,
+        "genetic_search_validation_prompts": 6,
+        "genetic_search_rerank_top_k": 6,
+        "anneal_search_from": "c2_calib_knapsack_mixed",
+        "anneal_search_steps": 40,
+        "anneal_search_mutation_rate": 0.12,
+        "anneal_search_initial_temp": 0.03,
+        "anneal_search_final_temp": 0.001,
+        "anneal_search_validation_prompts": 6,
+        "anneal_search_rerank_top_k": 6,
         "result_bucket": result_bucket,
     }
     return run_production_mix_configured_job.local(job)
