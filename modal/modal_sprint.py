@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +18,47 @@ HF_FILE = f"{MODEL_DIR}/model.safetensors"
 IQ4_FILE = "/cache/models/Qwen_Qwen3-1.7B-IQ4_XS.gguf"
 RESULT_ROOT = os.environ.get("PMRA_RESULT_ROOT", "/cache/results/pmra")
 BASELINE_REPO = "bartowski/Qwen_Qwen3-1.7B-GGUF"
+
+
+def _safe_path_component(name: object, max_len: int = 96) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._-") or "run"
+    if len(cleaned) <= max_len:
+        return cleaned
+    digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:10]
+    keep = max(1, max_len - len(digest) - 1)
+    prefix = cleaned[:keep].rstrip("._-") or "run"
+    return f"{prefix}_{digest}"
+
+
+def _safe_filename(name: object, max_len: int = 128) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._-") or "artifact"
+    if len(cleaned) <= max_len:
+        return cleaned
+    suffix = Path(cleaned).suffix
+    stem = cleaned[: -len(suffix)] if suffix else cleaned
+    digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:10]
+    keep = max(1, max_len - len(suffix) - len(digest) - 1)
+    prefix = stem[:keep].rstrip("._-") or "artifact"
+    return f"{prefix}_{digest}{suffix}"
+
+
+def _result_output_dir(bucket: object, name: object) -> str:
+    return f"{RESULT_ROOT}/{_safe_path_component(bucket)}/{_safe_path_component(name)}"
+
+
+def _result_json_path(bucket: object, name: object) -> str:
+    return f"{_result_output_dir(bucket, name)}/result.json"
+
+
+def _annotate_safe_result_name(result: dict, requested_name: object) -> dict:
+    result["requested_name"] = str(requested_name)
+    result["result_name"] = _safe_path_component(requested_name)
+    return result
+
+
+def _job_result_name(job: dict) -> str:
+    return str(job.get("result_name") or job.get("output_name") or job["name"])
+
 BASELINE_GGUFS = {
     "iq3_m": {
         "repo_id": BASELINE_REPO,
@@ -457,6 +500,13 @@ def _run(cmd: list[str], cwd: str = "/workspace") -> None:
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
+def _run_and_commit(cmd: list[str], cwd: str = "/workspace") -> None:
+    try:
+        _run(cmd, cwd)
+    finally:
+        cache_volume.commit()
+
+
 def _ensure_assets(iq4_url: str | None = None) -> tuple[str, str]:
     from huggingface_hub import snapshot_download
 
@@ -580,6 +630,7 @@ def _read_result(output_dir: str) -> dict:
         result = json.load(f)
     return {
         "output_dir": output_dir,
+        "result_json": str(path),
         "status": result.get("status") or result.get("verdict"),
         "decision_text": result.get("decision_text"),
         "overall": result.get("overall"),
@@ -602,7 +653,7 @@ def _candidate_suffix(candidate_variant: str) -> str:
 )
 def run_model_forward_job(job: dict) -> dict:
     hf_file, iq4_file = _ensure_assets(job.get("iq4_url"))
-    output_dir = f"{RESULT_ROOT}/phase_a_model_forward/{job['name']}"
+    output_dir = _result_output_dir("phase_a_model_forward", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/mlp_codebook_model_forward_gate.py",
@@ -650,8 +701,7 @@ def run_model_forward_job(job: dict) -> dict:
     ]
     if job.get("fit_payload_controls", False):
         cmd.append("--fit-payload-controls")
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     return _read_result(output_dir)
 
 
@@ -663,7 +713,7 @@ def run_model_forward_job(job: dict) -> dict:
 )
 def run_artifact_job(job: dict) -> dict:
     hf_file, _iq4_file = _ensure_assets(job.get("iq4_url"))
-    output_dir = f"{RESULT_ROOT}/phase_e_artifact/{job['name']}"
+    output_dir = _result_output_dir("phase_e_artifact", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/mlp_codebook_artifact_gate.py",
@@ -701,8 +751,7 @@ def run_artifact_job(job: dict) -> dict:
         "--device",
         "cuda",
     ]
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     return _read_result(output_dir)
 
 
@@ -715,7 +764,7 @@ def run_artifact_job(job: dict) -> dict:
 def run_mixed_rate_job(job: dict) -> dict:
     hf_file, iq4_file = _ensure_assets(job.get("iq4_url"))
     iq4_file = _ensure_job_gguf(job, iq4_file)
-    output_dir = f"{RESULT_ROOT}/phase_b_mixed_rate/{job['name']}"
+    output_dir = _result_output_dir("phase_b_mixed_rate", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/mlp_codebook_model_forward_gate.py",
@@ -764,8 +813,7 @@ def run_mixed_rate_job(job: dict) -> dict:
         "--device",
         "cuda",
     ]
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     return _read_result(output_dir)
 
 
@@ -778,7 +826,7 @@ def run_mixed_rate_job(job: dict) -> dict:
 def run_baseline_bakeoff_job(job: dict) -> dict:
     hf_file, default_iq4_file = _ensure_assets(job.get("iq4_url"))
     gguf_file = _ensure_job_gguf(job, default_iq4_file)
-    output_dir = f"{RESULT_ROOT}/phase_c_baseline_bakeoff/{job['name']}"
+    output_dir = _result_output_dir("phase_c_baseline_bakeoff", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/mlp_codebook_model_forward_gate.py",
@@ -829,8 +877,7 @@ def run_baseline_bakeoff_job(job: dict) -> dict:
     ]
     if job.get("fit_payload_controls", False):
         cmd.append("--fit-payload-controls")
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
     result["baseline_label"] = job.get("baseline_label")
     result["baseline_repo_id"] = job.get("gguf_repo_id")
@@ -846,7 +893,7 @@ def run_baseline_bakeoff_job(job: dict) -> dict:
 )
 def run_composition_job(job: dict) -> dict:
     hf_file, iq4_file = _ensure_assets(job.get("iq4_url"))
-    output_dir = f"{RESULT_ROOT}/phase_d_composition_sweep/{job['name']}"
+    output_dir = _result_output_dir("phase_d_composition_sweep", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/mlp_joint_codebook_composition_gate.py",
@@ -886,8 +933,7 @@ def run_composition_job(job: dict) -> dict:
         "--device",
         "cuda",
     ]
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     return _read_result(output_dir)
 
 
@@ -919,7 +965,8 @@ def run_production_mix_job(job: dict) -> dict:
             raise ValueError(f"unknown source label {label}; choose from {sorted(BASELINE_GGUFS) + ['iq4_xs']}")
         spec = BASELINE_GGUFS[label]
         source_paths[label] = _ensure_baseline_gguf(spec["repo_id"], spec["filename"])
-    output_dir = f"{RESULT_ROOT}/{job.get('result_bucket', 'run_007_c2_production_mixed_rate')}/{job['name']}"
+    result_name = _job_result_name(job)
+    output_dir = _result_output_dir(job.get("result_bucket", "run_007_c2_production_mixed_rate"), result_name)
     cmd = [
         sys.executable,
         "/workspace/scripts/production_mixed_rate_transcoder_gate.py",
@@ -1056,9 +1103,9 @@ def run_production_mix_job(job: dict) -> dict:
         cmd.extend(["--max-shrink-nll-loss", str(job["max_shrink_nll_loss"])])
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
+    _annotate_safe_result_name(result, result_name)
     result["low_source"] = job.get("low_source", "iq3_xs")
     result["target_source"] = job.get("target_source", "q3_k_m")
     result["high_sources"] = high_sources
@@ -1087,7 +1134,8 @@ def run_production_mix_configured_job(job: dict) -> dict:
         *demotion_labels,
     }
     source_paths = _ensure_configured_sources(config, required_labels)
-    output_dir = f"{RESULT_ROOT}/{job.get('result_bucket', 'run_008_c2_replication')}/{job['name']}"
+    result_name = _job_result_name(job)
+    output_dir = _result_output_dir(job.get("result_bucket", "run_008_c2_replication"), result_name)
     cmd = [
         sys.executable,
         "/workspace/scripts/production_mixed_rate_transcoder_gate.py",
@@ -1221,9 +1269,9 @@ def run_production_mix_configured_job(job: dict) -> dict:
         cmd.extend(["--max-shrink-nll-loss", str(job["max_shrink_nll_loss"])])
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
+    _annotate_safe_result_name(result, result_name)
     result["model_key"] = model_key
     result["low_source"] = job.get("low_source", "iq3_xs")
     result["target_source"] = job.get("target_source", "iq3_m")
@@ -1301,13 +1349,7 @@ def run_gpt_oss_heretic_selector_bakeoff_job(
     )
     job.update(
         {
-            "name": (
-                "gpt_oss_20b_heretic_c2_publiccal_wikitext_wikitext-2-raw-v1_"
-                f"train_to_validation_low_q2_k_target_q3_k_s_high_mxfp4_moe_iq4_xs_q3_k_m_q3_k_l_q4_k_s_q4_k_m_"
-                f"seed_{seed}_eval_{eval_prompts}_calib_{calib_prompts}_tensor_len_{eval_max_length}_"
-                "candidate_calib_knapsack_anneal_sweep_4p62_4p80_5p00_5p20_5p45_5p70_"
-                "genetic_8x12_val8_top6_anneal_60_val8_top8"
-            ),
+            "name": f"gptoss20b_heretic_bakeoff_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "sweep_payload_bpws": "4.62,4.80,5.00,5.20,5.45,5.70",
             "sweep_selectors": "calib_knapsack,calib_greedy,blend",
             "genetic_search_from": "c2_calib_knapsack_mixed",
@@ -1355,12 +1397,7 @@ def run_gpt_oss_heretic_direct_search_job(
     )
     job.update(
         {
-            "name": (
-                "gpt_oss_20b_heretic_c2_publiccal_wikitext_wikitext-2-raw-v1_"
-                f"train_to_validation_low_q2_k_target_q3_k_s_high_mxfp4_moe_iq4_xs_q3_k_m_q3_k_l_q4_k_s_q4_k_m_"
-                f"seed_{seed}_eval_{eval_prompts}_calib_{calib_prompts}_tensor_len_{eval_max_length}_"
-                "candidate_direct_anneal_genetic_10x16_direct_val8_top8_anneal_80_direct_val8_top8"
-            ),
+            "name": f"gptoss20b_heretic_direct_s{seed}_e{eval_prompts}_c{calib_prompts}",
             "genetic_search_direct": True,
             "genetic_search_generations": 10,
             "genetic_search_population": 16,
@@ -1469,13 +1506,7 @@ def run_olmo_tensor_direct_search_job(
     high_sources = "q2_k_s,q2_k,q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_s"
     candidate_variant = "c2_direct_anneal_mixed"
     job = {
-        "name": (
-            f"{model_key}_c2_publiccal_wikitext_wikitext-2-raw-v1_"
-            f"train_to_validation_low_{low_source}_target_{target_source}_"
-            f"high_{high_sources.replace(',', '_')}_seed_{seed}_eval_{eval_prompts}_"
-            f"calib_{calib_prompts}_{group_mode}_len_{eval_max_length}_"
-            "candidate_direct_anneal_genetic_8x16_direct_val8_top8_anneal_96_direct_val8_top8"
-        ),
+        "name": f"{model_key}_tensor_direct_s{seed}_e{eval_prompts}_c{calib_prompts}",
         "model_key": model_key,
         "seed": seed,
         "eval_prompts": eval_prompts,
@@ -1563,7 +1594,8 @@ def run_c2_artifact_job(job: dict) -> dict:
             spec = BASELINE_GGUFS[label]
             source_paths[label] = _ensure_baseline_gguf(spec["repo_id"], spec["filename"])
         tensor_profile = job.get("tensor_profile", "qwen")
-    output_dir = f"{RESULT_ROOT}/{job.get('artifact_bucket', 'run_007_c2_mixed_gguf_artifact')}/{job['name']}"
+    output_dir = _result_output_dir(job.get("artifact_bucket", "run_007_c2_mixed_gguf_artifact"), job["name"])
+    output_gguf = _safe_filename(job.get("output_gguf", "mixed.gguf"))
     cmd = [
         sys.executable,
         "/workspace/scripts/build_mixed_gguf_artifact.py",
@@ -1572,7 +1604,7 @@ def run_c2_artifact_job(job: dict) -> dict:
         "--output-dir",
         output_dir,
         "--output-gguf",
-        job.get("output_gguf", "mixed.gguf"),
+        output_gguf,
         "--variant",
         variant,
         "--metadata-source",
@@ -1582,8 +1614,7 @@ def run_c2_artifact_job(job: dict) -> dict:
     ]
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     report_path = Path(output_dir) / "artifact_report.json"
     with report_path.open("r", encoding="utf-8") as f:
         report = json.load(f)
@@ -1632,7 +1663,7 @@ def run_pmra_public_eval_job(job: dict) -> dict:
     result_name = job.get("result_name") or default_result_name
     result_json = job.get(
         "result_json",
-        f"{RESULT_ROOT}/{job.get('result_bucket', 'run_008_c2_subq3_iq2m_to_iq3xs_calib48_eval1024')}/{result_name}/result.json",
+        _result_json_path(job.get("result_bucket", "run_008_c2_subq3_iq2m_to_iq3xs_calib48_eval1024"), result_name),
     )
     selection_required_labels: set[str] = set()
     result_path = Path(result_json)
@@ -1661,7 +1692,7 @@ def run_pmra_public_eval_job(job: dict) -> dict:
         *selection_required_labels,
     }
     source_paths = _ensure_configured_sources(config, required_labels)
-    output_dir = f"{RESULT_ROOT}/{job.get('public_bucket', 'run_008_pmra_public_eval')}/{job['name']}"
+    output_dir = _result_output_dir(job.get("public_bucket", "run_008_pmra_public_eval"), job["name"])
     dataset_config = job.get("dataset_config", "wikitext-2-raw-v1")
     cmd = [
         sys.executable,
@@ -1701,8 +1732,7 @@ def run_pmra_public_eval_job(job: dict) -> dict:
         cmd.extend(["--dataset-config", dataset_config])
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
     result["model_key"] = model_key
     result["result_json"] = result_json
@@ -1741,9 +1771,9 @@ def _run_pmra_code_likelihood_inline(job: dict) -> dict:
     result_name = job.get("result_name") or default_result_core
     result_json = job.get(
         "result_json",
-        f"{RESULT_ROOT}/{job.get('result_bucket', 'run_009_gemma4_public_calibrated_wikitext_train_val')}/{result_name}/result.json",
+        _result_json_path(job.get("result_bucket", "run_009_gemma4_public_calibrated_wikitext_train_val"), result_name),
     )
-    output_dir = f"{RESULT_ROOT}/{job.get('coding_bucket', 'run_009_gemma4_code_likelihood')}/{job['name']}"
+    output_dir = _result_output_dir(job.get("coding_bucket", "run_009_gemma4_code_likelihood"), job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/evaluate_pmra_code_likelihood.py",
@@ -1778,8 +1808,7 @@ def _run_pmra_code_likelihood_inline(job: dict) -> dict:
     ]
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
     result["model_key"] = model_key
     result["result_json"] = result_json
@@ -1868,7 +1897,7 @@ def run_iq4_erasure_job(job: dict) -> dict:
         for label, spec in source_specs.items()
     }
     source_paths["iq4_xs"] = iq4_file
-    output_dir = f"{RESULT_ROOT}/run_007_c5_iq4_semantic_erasure/{job['name']}"
+    output_dir = _result_output_dir("run_007_c5_iq4_semantic_erasure", job["name"])
     cmd = [
         sys.executable,
         "/workspace/scripts/iq4_semantic_erasure_gate.py",
@@ -1910,8 +1939,7 @@ def run_iq4_erasure_job(job: dict) -> dict:
         cmd.append("--include-global-groups")
     for label, path in source_paths.items():
         cmd.extend(["--source", f"{label}={path}"])
-    _run(cmd)
-    cache_volume.commit()
+    _run_and_commit(cmd)
     result = _read_result(output_dir)
     result["iq4_source"] = job.get("iq4_source", "iq4_xs")
     result["target_source"] = job.get("target_source", "q3_k_m")
@@ -2307,17 +2335,17 @@ def phase_c2_artifact(
         f"{high_sources.replace(',', '_')}_seed_{seed}_eval_{eval_prompts}_calib_{calib_prompts}_{group_mode}"
     )
     result_name = result_name or default_result_name
-    result_json = f"{RESULT_ROOT}/{result_bucket}/{result_name}/result.json"
+    result_json = _result_json_path(result_bucket, result_name)
     variant_suffix = variant.replace("c2_", "").replace("_mixed", "")
     job = {
-        "name": artifact_name or f"{result_name}_{variant_suffix}_artifact",
+        "name": artifact_name or _safe_path_component(f"{result_name}_{variant_suffix}_artifact"),
         "result_json": result_json,
         "variant": variant,
         "metadata_source": low_source,
         "target_source": target_source,
         "high_sources": high_sources,
         "artifact_bucket": artifact_bucket,
-        "output_gguf": output_gguf or f"{result_name}_{variant_suffix}.gguf",
+        "output_gguf": output_gguf or _safe_filename(f"{result_name}_{variant_suffix}.gguf"),
     }
     if model_key:
         job["model_key"] = model_key

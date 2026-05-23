@@ -157,6 +157,150 @@ def parse_float_csv(text: str | None) -> list[float]:
     return [float(part) for part in parse_csv(text)]
 
 
+def load_jsonl_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(
+                    f"[c2] warning: ignoring corrupt checkpoint row {path}:{line_number}: {exc}",
+                    flush=True,
+                )
+    return rows
+
+
+def append_jsonl_row(path: Path, row: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+        f.flush()
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def prompt_digest(prompts: list[str]) -> str:
+    digest = hashlib.sha1()
+    for prompt in prompts:
+        digest.update(prompt.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def clean_checkpoint_row(row: dict) -> dict:
+    clean = dict(row)
+    clean.pop("_checkpoint_context", None)
+    return clean
+
+
+def load_eval_checkpoint(path: Path, context: dict) -> dict | None:
+    for row in reversed(load_jsonl_rows(path)):
+        if row.get("_checkpoint_context") == context and row.get("result") is not None:
+            print(f"[c2] checkpoint hit {context.get('kind', 'eval')}", flush=True)
+            return row["result"]
+    return None
+
+
+def append_eval_checkpoint(path: Path, context: dict, result: dict) -> None:
+    append_jsonl_row(path, {"_checkpoint_context": context, "result": result})
+
+
+def load_fp16_checkpoint(checkpoint_dir: Path, context: dict) -> dict | None:
+    meta_path = checkpoint_dir / "fp16_eval.json"
+    logits_path = checkpoint_dir / "fp16_last_logits.npz"
+    if not meta_path.exists() or not logits_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("_checkpoint_context") != context:
+            return None
+        loaded = np.load(logits_path)
+        result = dict(meta["result"])
+        result["captured_last_logits"] = [row for row in loaded["logits"]]
+        print("[c2] checkpoint hit fp16 reference eval", flush=True)
+        return result
+    except Exception as exc:
+        print(f"[c2] warning: ignoring fp16 checkpoint: {exc}", flush=True)
+        return None
+
+
+def write_fp16_checkpoint(checkpoint_dir: Path, context: dict, result: dict) -> None:
+    logits = result.get("captured_last_logits") or []
+    if not logits:
+        return
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tmp_logits_path = checkpoint_dir / "fp16_last_logits.tmp.npz"
+    logits_path = checkpoint_dir / "fp16_last_logits.npz"
+    np.savez_compressed(tmp_logits_path, logits=np.stack(logits))
+    tmp_logits_path.replace(logits_path)
+    write_json_atomic(
+        checkpoint_dir / "fp16_eval.json",
+        {"_checkpoint_context": context, "result": strip_logits(result)},
+    )
+
+
+def load_selection_search_cache(path: Path, index_key: str, context: dict) -> dict[tuple[tuple[str, str], ...], dict]:
+    cache: dict[tuple[tuple[str, str], ...], dict] = {}
+    for row in load_jsonl_rows(path):
+        if row.get("context") != context:
+            continue
+        selected = row.get("selected") or []
+        if row.get("signature") is not None:
+            sig = tuple(tuple(pair) for pair in row.get("signature", []))
+        else:
+            sig = selection_signature(selected)
+        nll = row.get("nll", row.get("search_nll"))
+        if nll is None:
+            continue
+        item = {
+            index_key: int(row.get(index_key, len(cache) + 1)),
+            "nll": float(nll),
+            "search_nll": float(row.get("search_nll", nll)),
+            "extra_bytes": int(row.get("extra_bytes", selected_extra_bytes(selected))),
+            "selected": selected,
+        }
+        if row.get("validation_nll") is not None:
+            item["validation_nll"] = float(row["validation_nll"])
+        cache[sig] = item
+    if cache:
+        print(f"[c2] loaded {len(cache)} cached search fitness rows from {path}", flush=True)
+    return cache
+
+
+def append_selection_search_cache(path: Path, item: dict, index_key: str, context: dict) -> None:
+    selected = item["selected"]
+    row = {
+        "context": context,
+        index_key: int(item[index_key]),
+        "signature": [list(pair) for pair in selection_signature(selected)],
+        "nll": float(item["nll"]),
+        "search_nll": float(item["search_nll"]),
+        "extra_bytes": int(item["extra_bytes"]),
+        "selected": selected,
+    }
+    if item.get("validation_nll") is not None:
+        row["validation_nll"] = float(item["validation_nll"])
+    append_jsonl_row(path, row)
+
+
 def source_readers(paths: dict[str, Path]) -> dict[str, dict]:
     readers = {}
     for label, path in paths.items():
@@ -1211,19 +1355,57 @@ def local_search_repair_selection(
     if selected_saved_bytes(start_selected) > 0:
         raise ValueError("local search currently supports promotion selections only")
 
+    cache_context = {
+        "kind": "local_search",
+        "base_source": base_source,
+        "budget_extra": int(budget_extra),
+        "fitness_prompt_digest": prompt_digest(local_search_prompts),
+        "max_length": int(args.calib_max_length),
+        "tensor_profile": str(args.tensor_profile),
+        "group_mode": str(args.group_mode),
+    }
+    cache_path = args.output_dir / "checkpoints" / "local_search_fitness.jsonl"
+    cache = load_selection_search_cache(cache_path, "candidate_index", cache_context)
+
+    def evaluate_cached(selected: list[dict], label: str) -> dict:
+        sig = selection_signature(selected)
+        if sig not in cache:
+            candidate_index = max((int(item["candidate_index"]) for item in cache.values()), default=0) + 1
+            print(
+                f"[c2] local search evaluating {label}: candidate={candidate_index} "
+                f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
+                flush=True,
+            )
+            eval_result = evaluate_selection_nll(
+                model,
+                tokenizer,
+                hf,
+                readers,
+                groups,
+                args,
+                base_source,
+                selected,
+                prompts=local_search_prompts,
+                max_length=args.calib_max_length,
+            )
+            cache[sig] = {
+                "candidate_index": int(candidate_index),
+                "nll": float(eval_result["nll"]),
+                "search_nll": float(eval_result["nll"]),
+                "extra_bytes": int(selected_extra_bytes(selected)),
+                "selected": list(selected),
+            }
+            append_selection_search_cache(cache_path, cache[sig], "candidate_index", cache_context)
+        else:
+            print(
+                f"[c2] local search checkpoint hit {label}: "
+                f"candidate={cache[sig]['candidate_index']} nll={cache[sig]['nll']:.6f}",
+                flush=True,
+            )
+        return cache[sig]
+
     current = list(start_selected)
-    current_eval = evaluate_selection_nll(
-        model,
-        tokenizer,
-        hf,
-        readers,
-        groups,
-        args,
-        base_source,
-        current,
-        prompts=local_search_prompts,
-        max_length=args.calib_max_length,
-    )
+    current_eval = evaluate_cached(current, "start")
     current_nll = float(current_eval["nll"])
     start_nll = current_nll
     accepted: list[dict] = []
@@ -1255,18 +1437,7 @@ def local_search_repair_selection(
                 f"{candidate_idx}/{len(candidates)}: {candidate['move']}",
                 flush=True,
             )
-            cand_eval = evaluate_selection_nll(
-                model,
-                tokenizer,
-                hf,
-                readers,
-                groups,
-                args,
-                base_source,
-                candidate["selected"],
-                prompts=local_search_prompts,
-                max_length=args.calib_max_length,
-            )
+            cand_eval = evaluate_cached(candidate["selected"], f"step {step} {candidate_idx}/{len(candidates)}")
             cand_nll = float(cand_eval["nll"])
             improvement = current_nll - cand_nll
             if improvement > best_improvement:
@@ -1499,7 +1670,18 @@ def genetic_search_selection(
     rerank_top_k = max(0, int(getattr(args, "genetic_search_rerank_top_k", 0) or 0))
     if validation_prompts and rerank_top_k <= 0:
         rerank_top_k = min(population_size, 8)
-    cache: dict[tuple[tuple[str, str], ...], dict] = {}
+    cache_context = {
+        "kind": "genetic",
+        "base_source": base_source,
+        "budget_extra": int(budget_extra),
+        "direct_search": bool(getattr(args, "genetic_search_direct", False)),
+        "fitness_prompt_digest": prompt_digest(search_prompts),
+        "validation_prompt_digest": prompt_digest(validation_prompts),
+        "max_length": int(args.calib_max_length),
+        "tensor_profile": str(args.tensor_profile),
+    }
+    cache_path = args.output_dir / "checkpoints" / "genetic_search_fitness.jsonl"
+    cache = load_selection_search_cache(cache_path, "genome_index", cache_context)
 
     print(
         f"[c2] genetic search fitness prompts={len(search_prompts)} "
@@ -1520,7 +1702,7 @@ def genetic_search_selection(
     def evaluate(selected: list[dict]) -> dict:
         sig = selection_signature(selected)
         if sig not in cache:
-            genome_index = len(cache) + 1
+            genome_index = max((int(item["genome_index"]) for item in cache.values()), default=0) + 1
             print(
                 f"[c2] genetic search evaluating genome {genome_index}: "
                 f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
@@ -1545,6 +1727,7 @@ def genetic_search_selection(
                 "extra_bytes": int(selected_extra_bytes(selected)),
                 "selected": selected,
             }
+            append_selection_search_cache(cache_path, cache[sig], "genome_index", cache_context)
             print(
                 f"[c2] genetic search genome {genome_index} nll={cache[sig]['nll']:.6f}",
                 flush=True,
@@ -1576,6 +1759,7 @@ def genetic_search_selection(
                 max_length=args.calib_max_length,
             )
             item["validation_nll"] = float(eval_result["nll"])
+            append_selection_search_cache(cache_path, item, "genome_index", cache_context)
             print(
                 f"[c2] genetic validation finalist genome={item['genome_index']} "
                 f"validation_nll={item['validation_nll']:.6f}",
@@ -1748,7 +1932,18 @@ def anneal_search_selection(
     rerank_top_k = max(0, int(getattr(args, "anneal_search_rerank_top_k", 0) or 0))
     if validation_prompts and rerank_top_k <= 0:
         rerank_top_k = min(8, max(1, steps))
-    cache: dict[tuple[tuple[str, str], ...], dict] = {}
+    cache_context = {
+        "kind": "anneal",
+        "base_source": base_source,
+        "budget_extra": int(budget_extra),
+        "direct_search": bool(getattr(args, "anneal_search_direct", False)),
+        "fitness_prompt_digest": prompt_digest(search_prompts),
+        "validation_prompt_digest": prompt_digest(validation_prompts),
+        "max_length": int(args.calib_max_length),
+        "tensor_profile": str(args.tensor_profile),
+    }
+    cache_path = args.output_dir / "checkpoints" / "anneal_search_fitness.jsonl"
+    cache = load_selection_search_cache(cache_path, "state_index", cache_context)
 
     print(
         f"[c2] anneal search fitness prompts={len(search_prompts)} "
@@ -1764,7 +1959,7 @@ def anneal_search_selection(
         selected = normalize(selected)
         sig = selection_signature(selected)
         if sig not in cache:
-            state_index = len(cache) + 1
+            state_index = max((int(item["state_index"]) for item in cache.values()), default=0) + 1
             print(
                 f"[c2] anneal search evaluating state {state_index}: "
                 f"groups={len(selected)} extra={selected_extra_bytes(selected)}",
@@ -1789,6 +1984,7 @@ def anneal_search_selection(
                 "extra_bytes": int(selected_extra_bytes(selected)),
                 "selected": selected,
             }
+            append_selection_search_cache(cache_path, cache[sig], "state_index", cache_context)
             print(
                 f"[c2] anneal search state {state_index} nll={cache[sig]['nll']:.6f}",
                 flush=True,
@@ -1902,6 +2098,7 @@ def anneal_search_selection(
                 max_length=args.calib_max_length,
             )
             item["validation_nll"] = float(eval_result["nll"])
+            append_selection_search_cache(cache_path, item, "state_index", cache_context)
             print(
                 f"[c2] anneal validation finalist state={item['state_index']} "
                 f"validation_nll={item['validation_nll']:.6f}",
@@ -2629,6 +2826,10 @@ def main() -> int:
     if missing:
         raise ValueError(f"missing source paths for {missing}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = args.output_dir / "checkpoints"
+    allocation_checkpoint_path = checkpoint_dir / "allocation_rows.jsonl"
+    demotion_checkpoint_path = checkpoint_dir / "demotion_rows.jsonl"
+    scalar_eval_checkpoint_path = checkpoint_dir / "scalar_evals.jsonl"
 
     py_rng = random.Random(args.seed)
     print("[c2] loading tokenizer/model", flush=True)
@@ -2666,14 +2867,35 @@ def main() -> int:
 
     with open_hf_tensor_source(args.hf) as hf:
         total_weights = total_weight_count(hf, model, specs)
-        print("[c2] evaluating fp16 reference", flush=True)
-        fp_eval = evaluate_model(model, tokenizer, eval_prompts, args)
+        fp_context = {
+            "kind": "fp16_reference",
+            "model_dir": str(args.model_dir),
+            "eval_prompt_digest": prompt_digest(eval_prompts),
+            "eval_max_length": int(args.eval_max_length),
+            "tensor_profile": args.tensor_profile,
+        }
+        fp_eval = load_fp16_checkpoint(checkpoint_dir, fp_context)
+        if fp_eval is None:
+            print("[c2] evaluating fp16 reference", flush=True)
+            fp_eval = evaluate_model(model, tokenizer, eval_prompts, args)
+            write_fp16_checkpoint(checkpoint_dir, fp_context, fp_eval)
         fp_last_logits = fp_eval["captured_last_logits"]
         results["fp16"] = add_byte_fields(strip_logits(fp_eval), total_weights * 2, total_weights, fp_eval["nll"])
 
         print(f"[c2] patching low source {args.low_source}", flush=True)
         patch_all_from_source(model, hf, readers, args.layers, args.low_source, args.group_mode, args.tensor_profile)
-        low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+        low_calib_context = {
+            "kind": "low_calibration",
+            "source": args.low_source,
+            "calib_prompt_digest": prompt_digest(calib_prompts),
+            "calib_max_length": int(args.calib_max_length),
+            "tensor_profile": args.tensor_profile,
+            "group_mode": args.group_mode,
+        }
+        low_calib = load_eval_checkpoint(scalar_eval_checkpoint_path, low_calib_context)
+        if low_calib is None:
+            low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+            append_eval_checkpoint(scalar_eval_checkpoint_path, low_calib_context, low_calib)
         print(f"[c2] low-source calibration NLL: {low_calib['nll']:.6f}", flush=True)
 
         direct_promotion_search = args.genetic_search_direct or args.anneal_search_direct
@@ -2681,6 +2903,29 @@ def main() -> int:
             print("[c2] building direct promotion options without per-group NLL scoring", flush=True)
             allocation_rows = build_direct_promotion_rows(readers, groups, args.low_source, high_sources)
         else:
+            allocation_context = {
+                "kind": "promotion",
+                "low_source": args.low_source,
+                "high_sources": high_sources,
+                "calib_prompt_digest": prompt_digest(calib_prompts),
+                "calib_max_length": int(args.calib_max_length),
+                "tensor_profile": args.tensor_profile,
+                "group_mode": args.group_mode,
+            }
+            allocation_rows = [
+                clean_checkpoint_row(row)
+                for row in load_jsonl_rows(allocation_checkpoint_path)
+                if row.get("_checkpoint_context") == allocation_context
+            ]
+            seen_promotion_keys = {
+                (str(row["group"]), str(row["source"]))
+                for row in allocation_rows
+            }
+            if allocation_rows:
+                print(
+                    f"[c2] loaded {len(allocation_rows)} promotion score checkpoints",
+                    flush=True,
+                )
             print("[c2] scoring production-format group promotions", flush=True)
             score_idx = 0
             score_total = len(groups) * len(high_sources)
@@ -2688,6 +2933,14 @@ def main() -> int:
                 low_bytes = group_payload_bytes(readers, groups, group, args.low_source)
                 for source in high_sources:
                     score_idx += 1
+                    key = (str(group), str(source))
+                    if key in seen_promotion_keys:
+                        if score_idx == 1 or score_idx % 20 == 0 or score_idx == score_total:
+                            print(
+                                f"[c2] checkpoint hit group {score_idx}/{score_total}: {group} -> {source}",
+                                flush=True,
+                            )
+                        continue
                     if score_idx == 1 or score_idx % 20 == 0 or score_idx == score_total:
                         print(f"[c2] scoring group {score_idx}/{score_total}: {group} -> {source}", flush=True)
                     high_bytes = group_payload_bytes(readers, groups, group, source)
@@ -2699,20 +2952,24 @@ def main() -> int:
                     patch_group(model, hf, readers, groups, group, args.low_source)
                     improvement = low_calib["nll"] - promoted_calib["nll"]
                     weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
-                    allocation_rows.append(
-                        {
-                            "group": group,
-                            "source": source,
-                            "low_bytes": int(low_bytes),
-                            "high_bytes": int(high_bytes),
-                            "extra_bytes": int(extra),
-                            "calib_nll": float(promoted_calib["nll"]),
-                            "calib_nll_improvement": float(improvement),
-                            "calib_score_per_mbyte": float(improvement / (extra / 1_000_000)),
-                            "weight_sse_delta": float(weight_delta),
-                            "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
-                        }
+                    row = {
+                        "group": group,
+                        "source": source,
+                        "low_bytes": int(low_bytes),
+                        "high_bytes": int(high_bytes),
+                        "extra_bytes": int(extra),
+                        "calib_nll": float(promoted_calib["nll"]),
+                        "calib_nll_improvement": float(improvement),
+                        "calib_score_per_mbyte": float(improvement / (extra / 1_000_000)),
+                        "weight_sse_delta": float(weight_delta),
+                        "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
+                    }
+                    allocation_rows.append(row)
+                    append_jsonl_row(
+                        allocation_checkpoint_path,
+                        {**row, "_checkpoint_context": allocation_context},
                     )
+                    seen_promotion_keys.add(key)
 
         demotion_rows: list[dict] = []
         if demotion_sources:
@@ -2726,8 +2983,39 @@ def main() -> int:
                 args.group_mode,
                 args.tensor_profile,
             )
-            base_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+            base_calib_context = {
+                "kind": "demotion_base_calibration",
+                "source": demotion_base_source,
+                "calib_prompt_digest": prompt_digest(calib_prompts),
+                "calib_max_length": int(args.calib_max_length),
+                "tensor_profile": args.tensor_profile,
+                "group_mode": args.group_mode,
+            }
+            base_calib = load_eval_checkpoint(scalar_eval_checkpoint_path, base_calib_context)
+            if base_calib is None:
+                base_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                append_eval_checkpoint(scalar_eval_checkpoint_path, base_calib_context, base_calib)
             print(f"[c2] demotion-base calibration NLL: {base_calib['nll']:.6f}", flush=True)
+            demotion_context = {
+                "kind": "demotion",
+                "base_source": demotion_base_source,
+                "demotion_sources": demotion_sources,
+                "calib_prompt_digest": prompt_digest(calib_prompts),
+                "calib_max_length": int(args.calib_max_length),
+                "tensor_profile": args.tensor_profile,
+                "group_mode": args.group_mode,
+            }
+            demotion_rows = [
+                clean_checkpoint_row(row)
+                for row in load_jsonl_rows(demotion_checkpoint_path)
+                if row.get("_checkpoint_context") == demotion_context
+            ]
+            seen_demotion_keys = {
+                (str(row["group"]), str(row["source"]))
+                for row in demotion_rows
+            }
+            if demotion_rows:
+                print(f"[c2] loaded {len(demotion_rows)} demotion score checkpoints", flush=True)
             print("[c2] scoring production-format group demotions", flush=True)
             demote_idx = 0
             demote_total = len(groups) * len(demotion_sources)
@@ -2735,6 +3023,14 @@ def main() -> int:
                 base_bytes = group_payload_bytes(readers, groups, group, demotion_base_source)
                 for source in demotion_sources:
                     demote_idx += 1
+                    key = (str(group), str(source))
+                    if key in seen_demotion_keys:
+                        if demote_idx == 1 or demote_idx % 20 == 0 or demote_idx == demote_total:
+                            print(
+                                f"[c2] checkpoint hit demotion {demote_idx}/{demote_total}: {group} -> {source}",
+                                flush=True,
+                            )
+                        continue
                     if demote_idx == 1 or demote_idx % 20 == 0 or demote_idx == demote_total:
                         print(
                             f"[c2] scoring demotion {demote_idx}/{demote_total}: {group} -> {source}",
@@ -2757,22 +3053,26 @@ def main() -> int:
                         source,
                         demotion_base_source,
                     )
-                    demotion_rows.append(
-                        {
-                            "group": group,
-                            "source": source,
-                            "base_source": demotion_base_source,
-                            "base_bytes": int(base_bytes),
-                            "demoted_bytes": int(demoted_bytes),
-                            "extra_bytes": 0,
-                            "saved_bytes": int(saved),
-                            "calib_nll": float(demoted_calib["nll"]),
-                            "calib_nll_loss": float(loss),
-                            "demotion_loss_per_mbyte": float(loss / (saved / 1_000_000)),
-                            "weight_sse_delta": float(weight_delta),
-                            "weight_score_per_mbyte": float(weight_delta / (saved / 1_000_000)),
-                        }
+                    row = {
+                        "group": group,
+                        "source": source,
+                        "base_source": demotion_base_source,
+                        "base_bytes": int(base_bytes),
+                        "demoted_bytes": int(demoted_bytes),
+                        "extra_bytes": 0,
+                        "saved_bytes": int(saved),
+                        "calib_nll": float(demoted_calib["nll"]),
+                        "calib_nll_loss": float(loss),
+                        "demotion_loss_per_mbyte": float(loss / (saved / 1_000_000)),
+                        "weight_sse_delta": float(weight_delta),
+                        "weight_score_per_mbyte": float(weight_delta / (saved / 1_000_000)),
+                    }
+                    demotion_rows.append(row)
+                    append_jsonl_row(
+                        demotion_checkpoint_path,
+                        {**row, "_checkpoint_context": demotion_context},
                     )
+                    seen_demotion_keys.add(key)
 
         low_payload = source_payload_bytes[args.low_source]
         target_payload = source_payload_bytes[args.target_source]
@@ -3028,7 +3328,31 @@ def main() -> int:
             base_payload = source_payload_bytes[base_source]
             variants_to_eval.append((name, None, selected, selected_payload_bytes(base_payload, selected)))
 
+        variant_checkpoint_path = checkpoint_dir / "variant_results.jsonl"
+        variant_context = {
+            "kind": "variant_eval",
+            "model_dir": str(args.model_dir),
+            "low_source": args.low_source,
+            "target_source": args.target_source,
+            "high_sources": high_sources,
+            "eval_prompt_digest": prompt_digest(eval_prompts),
+            "eval_max_length": int(args.eval_max_length),
+            "tensor_profile": args.tensor_profile,
+            "group_mode": args.group_mode,
+            "candidate_variant": args.candidate_variant,
+        }
+        variant_cache = {
+            str(row["name"]): row["result"]
+            for row in load_jsonl_rows(variant_checkpoint_path)
+            if row.get("_checkpoint_context") == variant_context and row.get("result") is not None
+        }
+        if variant_cache:
+            print(f"[c2] loaded {len(variant_cache)} variant eval checkpoints", flush=True)
         for name, source, selected, payload_bytes in variants_to_eval:
+            if name in variant_cache:
+                print(f"[c2] checkpoint hit variant {name}", flush=True)
+                results[name] = variant_cache[name]
+                continue
             if source is not None:
                 print(f"[c2] evaluating uniform source {name}", flush=True)
                 patch_all_from_source(model, hf, readers, args.layers, source, args.group_mode, args.tensor_profile)
@@ -3045,7 +3369,18 @@ def main() -> int:
                 )
                 apply_selection(model, hf, readers, groups, selected or [])
             eval_result = evaluate_model(model, tokenizer, eval_prompts, args, fp_last_logits)
-            results[name] = add_byte_fields(strip_logits(eval_result), payload_bytes, total_weights, results["fp16"]["nll"])
+            row_result = add_byte_fields(strip_logits(eval_result), payload_bytes, total_weights, results["fp16"]["nll"])
+            results[name] = row_result
+            append_jsonl_row(
+                variant_checkpoint_path,
+                {
+                    "_checkpoint_context": variant_context,
+                    "name": name,
+                    "source": source,
+                    "payload_bytes": int(payload_bytes),
+                    "result": row_result,
+                },
+            )
 
     serial_args = {
         "model_dir": args.model_dir,
@@ -3143,8 +3478,8 @@ def main() -> int:
     result["decision_text"] = decision_text
     result["next_step"] = next_step
 
-    (args.output_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    (args.output_dir / "result.md").write_text(make_markdown(result), encoding="utf-8")
+    write_json_atomic(args.output_dir / "result.json", result)
+    write_text_atomic(args.output_dir / "result.md", make_markdown(result))
     print(f"[c2] wrote {args.output_dir / 'result.md'}", flush=True)
     print(decision_text, flush=True)
     return 0
