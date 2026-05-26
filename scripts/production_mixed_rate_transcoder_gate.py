@@ -2444,6 +2444,42 @@ def compact_selection(selected: list[dict]) -> list[dict]:
     ]
 
 
+def materialize_selection_rows(seed_selection: list[dict], rows: list[dict], label: str) -> list[dict]:
+    by_key = {
+        (str(row["group"]), str(row["source"])): row
+        for row in rows
+    }
+    selected: list[dict] = []
+    missing: list[str] = []
+    for item in seed_selection:
+        key = (str(item["group"]), str(item["source"]))
+        row = by_key.get(key)
+        if row is None:
+            missing.append(f"{key[0]}->{key[1]}")
+        else:
+            selected.append(row)
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "..." if len(missing) > 8 else ""
+        raise ValueError(f"seed selection {label!r} has groups not available in this run: {preview}{suffix}")
+    return selected
+
+
+def load_seed_selection_result(path: Path, variant: str, rows: list[dict]) -> tuple[str, list[dict]]:
+    result = json.loads(path.read_text(encoding="utf-8"))
+    selections = result.get("selections") or {}
+    selected_variant = variant or result.get("args", {}).get("candidate_variant") or ""
+    if not selected_variant:
+        selected_variant = next(iter(selections), "")
+    if selected_variant not in selections:
+        raise ValueError(
+            f"seed selection variant {selected_variant!r} not found in {path}; "
+            f"available variants: {sorted(selections)}"
+        )
+    selected = materialize_selection_rows(selections[selected_variant], rows, selected_variant)
+    return selected_variant, selected
+
+
 def add_byte_fields(row: dict, payload_bytes: int, total_weights: int, fp_nll: float) -> dict:
     row["payload_bytes"] = int(payload_bytes)
     row["payload_bpw"] = float(payload_bytes * 8 / total_weights)
@@ -2714,6 +2750,22 @@ def main() -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--candidate-variant", default="c2_calib_greedy_mixed")
     parser.add_argument("--knapsack-max-states", type=int, default=50_000)
+    parser.add_argument(
+        "--seed-selection-result-json",
+        type=Path,
+        default=None,
+        help="Previous result.json whose selected variant should seed direct GA/anneal/local refinement.",
+    )
+    parser.add_argument(
+        "--seed-selection-variant",
+        default="",
+        help="Variant name to load from --seed-selection-result-json. Defaults to that result's candidate variant.",
+    )
+    parser.add_argument(
+        "--seed-selection-name",
+        default="external_seed_mixed",
+        help="Internal selection variant name for the loaded seed selection.",
+    )
     parser.add_argument(
         "--local-search-from",
         default="",
@@ -3155,6 +3207,21 @@ def main() -> int:
             if extra_budget is not None:
                 selection_extra_budgets[name] = int(extra_budget)
 
+        if args.seed_selection_result_json is not None:
+            seed_variant, seed_selected = load_seed_selection_result(
+                args.seed_selection_result_json,
+                args.seed_selection_variant,
+                allocation_rows,
+            )
+            seed_name = args.seed_selection_name or "external_seed_mixed"
+            seed_selected = repair_selection_to_budget(seed_selected, budget_extra)
+            record_selection(seed_name, seed_selected, args.low_source, budget_extra)
+            print(
+                f"[c2] loaded seed selection {seed_variant} as {seed_name}: "
+                f"groups={len(seed_selected)} extra={selected_extra_bytes(seed_selected)}",
+                flush=True,
+            )
+
         if not direct_promotion_search:
             record_selection("c2_calib_greedy_mixed", calib_selected, args.low_source, budget_extra)
             record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source, budget_extra)
@@ -3194,7 +3261,13 @@ def main() -> int:
                 genetic_base_source = args.low_source
                 genetic_budget_extra = budget_extra
                 genetic_variant = args.candidate_variant if args.candidate_variant.endswith("_genetic_mixed") else "c2_direct_genetic_mixed"
-                seed_variants = {}
+                seed_variants = {
+                    name: selected
+                    for name, selected in raw_selections.items()
+                    if selection_base_sources.get(name) == genetic_base_source
+                    and selected_saved_bytes(selected) == 0
+                    and selected_extra_bytes(selected) <= genetic_budget_extra
+                }
             else:
                 genetic_base_variant = args.genetic_search_from or infer_genetic_search_base_variant(args.candidate_variant)
                 if genetic_base_variant not in raw_selections:
@@ -3453,6 +3526,11 @@ def main() -> int:
         "device": args.device,
         "candidate_variant": args.candidate_variant,
         "knapsack_max_states": args.knapsack_max_states,
+        "seed_selection_result_json": (
+            str(args.seed_selection_result_json) if args.seed_selection_result_json is not None else ""
+        ),
+        "seed_selection_variant": args.seed_selection_variant,
+        "seed_selection_name": args.seed_selection_name,
         "local_search_from": args.local_search_from,
         "local_search_steps": args.local_search_steps,
         "local_search_candidates": args.local_search_candidates,

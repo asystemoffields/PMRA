@@ -114,16 +114,18 @@ PMRA is useful when you want to:
 
 For a quick pass through the repo, use this order:
 
-1. This README - the showcase-friendly explanation of what PMRA is, how mixing
+1. This README - explanation of what PMRA is, how mixing
    works, and why knapsack is the default selector.
-2. [PMRA Hugging Face Collection](https://huggingface.co/collections/Asystemoffields/pmra-6a1067359be8a5f82021efe5) -
+2.**[The Guide](docs/GUIDE.md)** - more detailed explanation of what PMRA does, why uniform quantization wastes bits, how probing and
+   Fisher-guided profiling work, and what the output looks like.
+3. [PMRA Hugging Face Collection](https://huggingface.co/collections/Asystemoffields/pmra-6a1067359be8a5f82021efe5) -
    public GGUF mixes and model cards.
-3. [Artifact Index](docs/ARTIFACT_INDEX.md) - released mixes, reports, and
+4. [Artifact Index](docs/ARTIFACT_INDEX.md) - released mixes, reports, and
    metrics.
-4. [Method](docs/METHOD.md) - implementation-level method notes.
-5. [Reproduce](docs/REPRODUCE.md) - local, Colab, and optional Modal paths for
+5. [Method](docs/METHOD.md) - implementation-level method notes.
+6. [Reproduce](docs/REPRODUCE.md) - local, Colab, and optional Modal paths for
    rebuilding selector results and GGUF artifacts.
-6. [Evidence Ledger](docs/EVIDENCE.md) - full research trail, including failed
+7. [Evidence Docs](docs/EVIDENCE.md) - full research trail, including failed
    and superseded gates.
 
 ## Repository Layout

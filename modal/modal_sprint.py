@@ -437,6 +437,22 @@ MODEL_CONFIGS = {
             "q4_k_m": "gemma-4-E2B-it.Q4_K_M.gguf",
         },
     },
+    "gemma4_e2b_it_heretic_ara": {
+        "model_id": "p-e-w/gemma-4-E2B-it-heretic-ara",
+        "model_dir": "/cache/models/gemma4-e2b-it-heretic-ara",
+        "hf_file": "/cache/models/gemma4-e2b-it-heretic-ara/model.safetensors",
+        "baseline_repo": "mradermacher/gemma-4-E2B-it-heretic-ara-GGUF",
+        "tensor_profile": "gemma4",
+        "layers": ",".join(str(i) for i in range(35)),
+        "baseline_ggufs": {
+            "q2_k": "gemma-4-E2B-it-heretic-ara.Q2_K.gguf",
+            "q3_k_s": "gemma-4-E2B-it-heretic-ara.Q3_K_S.gguf",
+            "q3_k_m": "gemma-4-E2B-it-heretic-ara.Q3_K_M.gguf",
+            "q3_k_l": "gemma-4-E2B-it-heretic-ara.Q3_K_L.gguf",
+            "iq4_xs": "gemma-4-E2B-it-heretic-ara.IQ4_XS.gguf",
+            "q4_k_m": "gemma-4-E2B-it-heretic-ara.Q4_K_M.gguf",
+        },
+    },
     "gemma4_e4b": {
         "model_id": "google/gemma-4-E4B",
         "model_dir": "/cache/models/gemma4-e4b",
@@ -1044,6 +1060,12 @@ def run_production_mix_job(job: dict) -> dict:
         cmd.extend(["--sweep-payload-bpws", job["sweep_payload_bpws"]])
     if job.get("sweep_selectors", ""):
         cmd.extend(["--sweep-selectors", job["sweep_selectors"]])
+    if job.get("seed_selection_result_json"):
+        cmd.extend(["--seed-selection-result-json", job["seed_selection_result_json"]])
+    if job.get("seed_selection_variant"):
+        cmd.extend(["--seed-selection-variant", job["seed_selection_variant"]])
+    if job.get("seed_selection_name"):
+        cmd.extend(["--seed-selection-name", job["seed_selection_name"]])
     if job.get("local_search_from", ""):
         cmd.extend(["--local-search-from", job["local_search_from"]])
     if int(job.get("local_search_steps", 0) or 0) > 0:
@@ -1210,6 +1232,12 @@ def run_production_mix_configured_job(job: dict) -> dict:
         cmd.extend(["--sweep-payload-bpws", job["sweep_payload_bpws"]])
     if job.get("sweep_selectors", ""):
         cmd.extend(["--sweep-selectors", job["sweep_selectors"]])
+    if job.get("seed_selection_result_json"):
+        cmd.extend(["--seed-selection-result-json", job["seed_selection_result_json"]])
+    if job.get("seed_selection_variant"):
+        cmd.extend(["--seed-selection-variant", job["seed_selection_variant"]])
+    if job.get("seed_selection_name"):
+        cmd.extend(["--seed-selection-name", job["seed_selection_name"]])
     if job.get("local_search_from", ""):
         cmd.extend(["--local-search-from", job["local_search_from"]])
     if int(job.get("local_search_steps", 0) or 0) > 0:
@@ -2403,6 +2431,8 @@ def phase_c2_replicate(
     seeds: str = "6,7,8",
     eval_prompts: int = 256,
     calib_prompts: int = 12,
+    calib_max_length: int = 128,
+    eval_max_length: int = 128,
     layers: str = "",
     group_mode: str = "tensor",
     low_source: str = "iq3_xs",
@@ -2436,6 +2466,10 @@ def phase_c2_replicate(
     demotion_base_source: str = "",
     demotion_selectors: str = "reverse_knapsack",
     max_shrink_nll_loss: float = 0.05,
+    seed_selection_result_json: str = "",
+    seed_selection_variant: str = "",
+    seed_selection_name: str = "external_seed_mixed",
+    use_heavy: bool = False,
     result_bucket: str = "run_008_c2_replication",
 ):
     """Run a C2 mixed-rate replication gate on a configured second model."""
@@ -2462,6 +2496,8 @@ def phase_c2_replicate(
             frontier_suffix += f"_val{anneal_search_validation_prompts}"
             if anneal_search_rerank_top_k:
                 frontier_suffix += f"_top{anneal_search_rerank_top_k}"
+    if seed_selection_result_json:
+        frontier_suffix += f"_seeded_{_safe_path_component(seed_selection_variant or seed_selection_name or 'external')}"
     if demotion_sources:
         frontier_suffix += f"_demote_{demotion_sources.replace(',', '_')}"
     jobs = [
@@ -2475,6 +2511,8 @@ def phase_c2_replicate(
             "seed": seed,
             "eval_prompts": eval_prompts,
             "calib_prompts": calib_prompts,
+            "calib_max_length": calib_max_length,
+            "eval_max_length": eval_max_length,
             "layers": layers or MODEL_CONFIGS[model_key]["layers"],
             "group_mode": group_mode,
             "low_source": low_source,
@@ -2508,13 +2546,16 @@ def phase_c2_replicate(
             "demotion_base_source": demotion_base_source or None,
             "demotion_selectors": demotion_selectors,
             "max_shrink_nll_loss": max_shrink_nll_loss,
+            "seed_selection_result_json": seed_selection_result_json,
+            "seed_selection_variant": seed_selection_variant,
+            "seed_selection_name": seed_selection_name,
             "result_bucket": result_bucket,
         }
         for seed in seed_values
     ]
     runner = (
         run_production_mix_configured_heavy_job
-        if any(MODEL_CONFIGS[job["model_key"]].get("heavy") for job in jobs)
+        if use_heavy or any(MODEL_CONFIGS[job["model_key"]].get("heavy") for job in jobs)
         else run_production_mix_configured_job
     )
     for result in runner.map(jobs):
