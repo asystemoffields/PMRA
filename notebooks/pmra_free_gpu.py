@@ -134,10 +134,27 @@ subprocess.run(
 )
 # mamba-ssm + causal-conv1d needed for NemotronH (compiles CUDA kernels — takes a few minutes)
 if cfg["tensor_profile"] == "nemotron_h":
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "mamba-ssm", "causal-conv1d"],
-        check=True,
+    import torch
+    print(f"  torch={torch.__version__}  cuda={torch.version.cuda}  python={sys.version.split()[0]}")
+    # `--no-build-isolation` lets the build see Kaggle's torch/CUDA. Without it,
+    # pip creates a clean env that can't compile against the right backend.
+    install_proc = subprocess.run(
+        [sys.executable, "-m", "pip", "install",
+         "causal-conv1d", "mamba-ssm", "--no-build-isolation"],
+        capture_output=True, text=True,
     )
+    print(install_proc.stdout[-2000:] if install_proc.stdout else "")
+    if install_proc.returncode != 0:
+        print("STDERR:", install_proc.stderr[-2000:])
+        raise SystemExit(f"mamba-ssm install failed (exit {install_proc.returncode})")
+    # Verify the import works before continuing — silent install failures have
+    # bitten us before (cell 5 ImportError after cell 2 reported success).
+    try:
+        import mamba_ssm  # noqa: F401
+        from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn  # noqa: F401
+        print("  mamba-ssm import verified")
+    except Exception as e:
+        raise SystemExit(f"mamba-ssm installed but import fails: {e!r}")
 print("Dependencies installed")
 
 # %% [markdown]
