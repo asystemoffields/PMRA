@@ -372,7 +372,7 @@ def load_model_for_profile(model_dir: str, tensor_profile: str, device: torch.de
         except ImportError:
             model_cls = AutoModelForCausalLM
     extra_kwargs: dict = {}
-    if tensor_profile == "nemotron_h":
+    if tensor_profile in {"nemotron_h", "qwen35"}:
         extra_kwargs["trust_remote_code"] = True
     return model_cls.from_pretrained(
         model_dir,

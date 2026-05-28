@@ -41,13 +41,14 @@ MODEL_CONFIGS = {
         "group_mode": "tensor",           # tensor-level granularity
         "low_source": "iq2_m",
         "target_source": "iq3_xs",
-        "high_sources": ["q3_k_s", "q3_k_m", "iq4_xs"],
+        # Trimmed from 3 to 2 high_sources: low/target/3-high = 5 GGUFs ≈ 13 GB
+        # plus 8 GB HF weights overflows Kaggle's 19.5 GB working dir.
+        "high_sources": ["q3_k_s", "iq4_xs"],
         # Map from label used by the pipeline → actual GGUF filename suffix
         "source_quants": {
             "iq2_m":  "IQ2_M",
             "iq3_xs": "IQ3_XS",
             "q3_k_s": "Q3_K_S",
-            "q3_k_m": "Q3_K_M",
             "iq4_xs": "IQ4_XS",
         },
         "calib_prompts": 12,
@@ -66,15 +67,14 @@ MODEL_CONFIGS = {
         "group_mode": "layer_family",      # coarser grouping (matches abliterated run)
         "low_source": "iq2_m",
         "target_source": "iq3_xs",
-        "high_sources": ["q3_k_s", "q3_k_m", "q3_k_l", "iq4_xs", "q4_k_m"],
+        # Trimmed from 5 to 2 high_sources: Kaggle's 19.5 GB working dir
+        # cannot hold 7 GGUFs (~18 GB) + 9 GB HF weights.
+        "high_sources": ["q3_k_s", "iq4_xs"],
         "source_quants": {
             "iq2_m":  "IQ2_M",
             "iq3_xs": "IQ3_XS",
             "q3_k_s": "Q3_K_S",
-            "q3_k_m": "Q3_K_M",
-            "q3_k_l": "Q3_K_L",
             "iq4_xs": "IQ4_XS",
-            "q4_k_m": "Q4_K_M",
         },
         "calib_prompts": 12,
         "eval_prompts": 64,
