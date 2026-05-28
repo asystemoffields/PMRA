@@ -132,6 +132,12 @@ subprocess.run(
      "gguf", "safetensors", "datasets", "huggingface_hub", "accelerate", "sentencepiece"],
     check=True,
 )
+# mamba-ssm + causal-conv1d needed for NemotronH (compiles CUDA kernels — takes a few minutes)
+if cfg["tensor_profile"] == "nemotron_h":
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "mamba-ssm", "causal-conv1d"],
+        check=True,
+    )
 print("Dependencies installed")
 
 # %% [markdown]
