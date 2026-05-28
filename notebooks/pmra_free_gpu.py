@@ -132,6 +132,18 @@ subprocess.run(
      "gguf", "safetensors", "datasets", "huggingface_hub", "accelerate", "sentencepiece"],
     check=True,
 )
+# Qwen3.5 (model_type=qwen3_5) needs newer transformers than Kaggle's preinstalled.
+# Nemotron-H also benefits — both are recent architectures.
+import transformers
+print(f"  preinstalled transformers: {transformers.__version__}")
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "transformers"],
+    check=True,
+)
+# Re-check after upgrade
+import importlib
+importlib.reload(transformers)
+print(f"  after upgrade:             {transformers.__version__}")
 # mamba-ssm + causal-conv1d needed for NemotronH (compiles CUDA kernels — takes a few minutes)
 if cfg["tensor_profile"] == "nemotron_h":
     import torch
