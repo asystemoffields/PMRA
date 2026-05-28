@@ -196,10 +196,23 @@ source_paths = {}
 all_sources = {cfg["low_source"], cfg["target_source"]} | set(cfg["high_sources"])
 
 dataset_slug = cfg.get("gguf_dataset_slug", "")
-dataset_root = Path("/kaggle/input") / dataset_slug.split("/")[-1] if dataset_slug else None
+# Kaggle mounts datasets under several layouts depending on age/config:
+#   - /kaggle/input/<dataset_name>/
+#   - /kaggle/input/datasets/<user>/<dataset_name>/
+# Try them in order.
+dataset_root = None
+if dataset_slug:
+    user, name = dataset_slug.split("/", 1) if "/" in dataset_slug else (None, dataset_slug)
+    for candidate in [
+        Path("/kaggle/input") / name,
+        Path("/kaggle/input/datasets") / (user or "") / name,
+    ]:
+        if candidate.exists():
+            dataset_root = candidate
+            break
 # In BUILD_DATASET mode we force download even if the mount exists — the goal
 # is to refresh and re-push the dataset, not consume it.
-use_dataset = bool(dataset_root and dataset_root.exists() and not BUILD_DATASET)
+use_dataset = bool(dataset_root and not BUILD_DATASET)
 
 if use_dataset:
     print(f"Reading {len(all_sources)} GGUF variants from mounted dataset: {dataset_root}")
