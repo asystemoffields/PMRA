@@ -26,6 +26,15 @@
 MODEL_KEY = "nemotron_4b"  # "nemotron_4b" or "qwen35_4b"
 # =============================================================
 
+# Set to True once per model to build the Kaggle Dataset that holds the GGUF
+# sources. The notebook will download all variants, push them as a private
+# dataset under cfg["gguf_dataset_slug"], then halt before the HF-model
+# download (which wouldn't fit alongside the GGUFs). After the dataset is
+# live, add it to the notebook (Add Input -> Datasets, search by slug), set
+# this back to False, and re-run from the top — the run-mode path reads
+# straight from /kaggle/input/ and skips the download.
+BUILD_DATASET = False
+
 # HuggingFace token for pushing results (optional — set in Kaggle secrets or paste here)
 import os
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
@@ -41,16 +50,16 @@ MODEL_CONFIGS = {
         "group_mode": "tensor",           # tensor-level granularity
         "low_source": "iq2_m",
         "target_source": "iq3_xs",
-        # Trimmed from 3 to 2 high_sources: low/target/3-high = 5 GGUFs ≈ 13 GB
-        # plus 8 GB HF weights overflows Kaggle's 19.5 GB working dir.
-        "high_sources": ["q3_k_s", "iq4_xs"],
+        "high_sources": ["q3_k_s", "q3_k_m", "iq4_xs"],
         # Map from label used by the pipeline → actual GGUF filename suffix
         "source_quants": {
             "iq2_m":  "IQ2_M",
             "iq3_xs": "IQ3_XS",
             "q3_k_s": "Q3_K_S",
+            "q3_k_m": "Q3_K_M",
             "iq4_xs": "IQ4_XS",
         },
+        "gguf_dataset_slug": "asystemoffields/nemotron3-nano-4b-ggufs",
         "calib_prompts": 12,
         "eval_prompts": 64,
         "calib_max_length": 96,
@@ -67,15 +76,17 @@ MODEL_CONFIGS = {
         "group_mode": "layer_family",      # coarser grouping (matches abliterated run)
         "low_source": "iq2_m",
         "target_source": "iq3_xs",
-        # Trimmed from 5 to 2 high_sources: Kaggle's 19.5 GB working dir
-        # cannot hold 7 GGUFs (~18 GB) + 9 GB HF weights.
-        "high_sources": ["q3_k_s", "iq4_xs"],
+        "high_sources": ["q3_k_s", "q3_k_m", "q3_k_l", "iq4_xs", "q4_k_m"],
         "source_quants": {
             "iq2_m":  "IQ2_M",
             "iq3_xs": "IQ3_XS",
             "q3_k_s": "Q3_K_S",
+            "q3_k_m": "Q3_K_M",
+            "q3_k_l": "Q3_K_L",
             "iq4_xs": "IQ4_XS",
+            "q4_k_m": "Q4_K_M",
         },
+        "gguf_dataset_slug": "asystemoffields/qwen35-4b-ggufs",
         "calib_prompts": 12,
         "eval_prompts": 64,
         "calib_max_length": 96,
@@ -170,10 +181,13 @@ if cfg["tensor_profile"] == "nemotron_h":
 print("Dependencies installed")
 
 # %% [markdown]
-# ## 3. Download GGUF Sources
+# ## 3. Locate GGUF Sources
 #
-# Pull the pre-quantized GGUF variants we need from HuggingFace.
-# bartowski's quants are imatrix-calibrated, so we skip generating our own.
+# Prefer GGUFs from a mounted Kaggle Dataset (`/kaggle/input/<slug>/`) — that
+# keeps `/kaggle/working` (19.5 GB cap) free for the HF model + outputs.
+# Fall back to HuggingFace download otherwise.
+#
+# To create the dataset once, see the "One-time dataset builder" cell below.
 
 # %%
 from huggingface_hub import hf_hub_download
@@ -181,21 +195,89 @@ from huggingface_hub import hf_hub_download
 source_paths = {}
 all_sources = {cfg["low_source"], cfg["target_source"]} | set(cfg["high_sources"])
 
-print(f"Downloading {len(all_sources)} GGUF variants from {cfg['gguf_repo']}...")
-for label in sorted(all_sources):
-    quant_suffix = cfg["source_quants"][label]
-    filename = f"{cfg['gguf_prefix']}-{quant_suffix}.gguf"
-    print(f"  {label:10s} -> {filename}")
-    local_path = hf_hub_download(
-        repo_id=cfg["gguf_repo"],
-        filename=filename,
-        local_dir=str(GGUF_DIR),
-        local_dir_use_symlinks=False,
-    )
-    source_paths[label] = str(local_path)
-    print(f"             saved to {local_path}")
+dataset_slug = cfg.get("gguf_dataset_slug", "")
+dataset_root = Path("/kaggle/input") / dataset_slug.split("/")[-1] if dataset_slug else None
+# In BUILD_DATASET mode we force download even if the mount exists — the goal
+# is to refresh and re-push the dataset, not consume it.
+use_dataset = bool(dataset_root and dataset_root.exists() and not BUILD_DATASET)
 
-print(f"\nAll GGUF sources downloaded ({len(source_paths)} files)")
+if use_dataset:
+    print(f"Reading {len(all_sources)} GGUF variants from mounted dataset: {dataset_root}")
+    for label in sorted(all_sources):
+        quant_suffix = cfg["source_quants"][label]
+        filename = f"{cfg['gguf_prefix']}-{quant_suffix}.gguf"
+        local_path = dataset_root / filename
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"Dataset is mounted but missing {filename}. "
+                f"Re-run the dataset builder to include all required quants."
+            )
+        source_paths[label] = str(local_path)
+        print(f"  {label:10s} <- {local_path}")
+else:
+    if dataset_slug:
+        print(f"NOTE: dataset {dataset_slug} not mounted; falling back to HF download.")
+        print(f"      Add it as Input (Notebook UI > Add Input > Datasets) to skip download next time.")
+    print(f"Downloading {len(all_sources)} GGUF variants from {cfg['gguf_repo']}...")
+    for label in sorted(all_sources):
+        quant_suffix = cfg["source_quants"][label]
+        filename = f"{cfg['gguf_prefix']}-{quant_suffix}.gguf"
+        print(f"  {label:10s} -> {filename}")
+        local_path = hf_hub_download(
+            repo_id=cfg["gguf_repo"],
+            filename=filename,
+            local_dir=str(GGUF_DIR),
+            local_dir_use_symlinks=False,
+        )
+        source_paths[label] = str(local_path)
+        print(f"             saved to {local_path}")
+
+print(f"\nGGUF sources ready ({len(source_paths)} files, {'dataset-mounted' if use_dataset else 'downloaded'})")
+
+# %% [markdown]
+# ### 3a. (One-time) Push GGUFs to a Kaggle Dataset
+#
+# Active only when `BUILD_DATASET=True` (set in cell 1). Pushes the
+# downloaded GGUFs as a private Kaggle Dataset, then halts the run so the
+# HF model download doesn't try to fight the GGUFs for `/kaggle/working`.
+
+# %%
+if BUILD_DATASET:
+    import json as _json
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
+    dataset_slug = cfg.get("gguf_dataset_slug")
+    if not dataset_slug:
+        raise RuntimeError(f"No gguf_dataset_slug configured for {MODEL_KEY}")
+    print(f"Pushing dataset {dataset_slug} from {GGUF_DIR}...")
+
+    # The Kaggle API requires a dataset-metadata.json next to the files.
+    user, slug = dataset_slug.split("/")
+    (GGUF_DIR / "dataset-metadata.json").write_text(_json.dumps({
+        "title": f"{slug} — GGUFs for PMRA",
+        "id": dataset_slug,
+        "licenses": [{"name": "CC0-1.0"}],
+    }, indent=2))
+
+    api = KaggleApi()
+    api.authenticate()
+    try:
+        api.dataset_create_new(folder=str(GGUF_DIR), public=False, quiet=False)
+        print(f"\nDataset created: https://www.kaggle.com/datasets/{dataset_slug}")
+    except Exception as e:
+        print(f"create_new failed ({e!r}); trying version bump...")
+        api.dataset_create_version(
+            folder=str(GGUF_DIR),
+            version_notes="Updated GGUFs",
+            quiet=False,
+        )
+        print(f"Dataset version pushed: https://www.kaggle.com/datasets/{dataset_slug}")
+
+    print(
+        f"\nNext: Add Input -> Datasets, search '{dataset_slug}'."
+        f"\nThen set BUILD_DATASET=False at the top and re-run from cell 1."
+    )
+    raise SystemExit("Dataset build complete; halting before HF model download.")
 
 # %% [markdown]
 # ## 4. Download HF Model
