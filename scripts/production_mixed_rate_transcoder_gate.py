@@ -349,6 +349,7 @@ SUPPORTED_TENSOR_PROFILES = {
     "gemma4",
     "mistral3",
     "granite",
+    "nemotron_h",
     "olmo2",
     "olmo3",
     "gpt_oss",
@@ -370,10 +371,14 @@ def load_model_for_profile(model_dir: str, tensor_profile: str, device: torch.de
             model_cls = Qwen3_5ForConditionalGeneration
         except ImportError:
             model_cls = AutoModelForCausalLM
+    extra_kwargs: dict = {}
+    if tensor_profile == "nemotron_h":
+        extra_kwargs["trust_remote_code"] = True
     return model_cls.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
+        **extra_kwargs,
     ).to(device).eval()
 
 
@@ -411,6 +416,15 @@ def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str =
             ),
             TensorSpec("model.language_model.embed_tokens.weight", "token_embd.weight", "global:embed"),
         ]
+    elif tensor_profile == "nemotron_h":
+        # NemotronH hybrid: M=Mamba2, -=MLP-only, *=Attention-only (42 layers)
+        _NEMOTRON_H_PATTERN = "M-M-M-MM-M-M*-M-M*-M-M-M*-M-M-MM*-MMM-M-M-"
+        hf_root = "backbone"
+        specs = [
+            TensorSpec(f"{hf_root}.embeddings.weight", "token_embd.weight", "global:embed"),
+            TensorSpec("lm_head.weight", "output.weight", "global:output"),
+            TensorSpec(f"{hf_root}.norm_f.weight", "output_norm.weight", "global:norm"),
+        ]
     else:
         raise ValueError(f"unknown tensor profile {tensor_profile!r}")
 
@@ -419,6 +433,8 @@ def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str =
             hf_prefix = f"model.language_model.layers.{layer}"
         elif tensor_profile in {"mistral3", "qwen35"}:
             hf_prefix = f"model.language_model.layers.{layer}"
+        elif tensor_profile == "nemotron_h":
+            hf_prefix = f"backbone.layers.{layer}"
         else:
             hf_prefix = f"model.layers.{layer}"
         gguf_prefix = f"blk.{layer}"
@@ -478,6 +494,55 @@ def build_tensor_specs(layers: list[int], group_mode: str, tensor_profile: str =
                 group = attn_group if short.startswith("attn") else mlp_group
                 group = group or f"L{layer}:{short}"
                 specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+            continue
+
+        if tensor_profile == "nemotron_h":
+            # Heterogeneous layers: M=Mamba2, -=MLP-only, *=Attention-only
+            layer_type = _NEMOTRON_H_PATTERN[layer] if layer < len(_NEMOTRON_H_PATTERN) else "M"
+            if group_mode == "layer_family":
+                if layer_type == "M":
+                    block_group = f"L{layer}:ssm"
+                elif layer_type == "-":
+                    block_group = f"L{layer}:mlp"
+                else:
+                    block_group = f"L{layer}:attn"
+            else:
+                block_group = ""
+            # Input norm (all layer types)
+            norm_group = block_group or f"L{layer}:attn_norm"
+            specs.append(TensorSpec(f"{hf_prefix}.norm.weight", f"{gguf_prefix}.attn_norm.weight", norm_group))
+            if layer_type == "M":  # Mamba2 SSM
+                ssm_pairs = [
+                    ("mixer.in_proj.weight", "ssm_in.weight", "ssm_in"),
+                    ("mixer.conv1d.weight", "ssm_conv1d.weight", "ssm_conv1d"),
+                    ("mixer.conv1d.bias", "ssm_conv1d.bias", "ssm_conv1d_bias"),
+                    ("mixer.dt_bias", "ssm_dt.bias", "ssm_dt_bias"),
+                    ("mixer.A_log", "ssm_a", "ssm_a"),
+                    ("mixer.D", "ssm_d", "ssm_d"),
+                    ("mixer.norm.weight", "ssm_norm.weight", "ssm_norm"),
+                    ("mixer.out_proj.weight", "ssm_out.weight", "ssm_out"),
+                ]
+                for hf_tail, gguf_tail, short in ssm_pairs:
+                    group = block_group or f"L{layer}:{short}"
+                    specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+            elif layer_type == "-":  # MLP-only (relu² — no gate_proj)
+                mlp_pairs = [
+                    ("mixer.up_proj.weight", "ffn_up.weight", "ffn_up"),
+                    ("mixer.down_proj.weight", "ffn_down.weight", "ffn_down"),
+                ]
+                for hf_tail, gguf_tail, short in mlp_pairs:
+                    group = block_group or f"L{layer}:{short}"
+                    specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
+            elif layer_type == "*":  # Attention-only (no MLP sublayer)
+                attn_pairs = [
+                    ("mixer.q_proj.weight", "attn_q.weight", "attn_q"),
+                    ("mixer.k_proj.weight", "attn_k.weight", "attn_k"),
+                    ("mixer.v_proj.weight", "attn_v.weight", "attn_v"),
+                    ("mixer.o_proj.weight", "attn_output.weight", "attn_output"),
+                ]
+                for hf_tail, gguf_tail, short in attn_pairs:
+                    group = block_group or f"L{layer}:{short}"
+                    specs.append(TensorSpec(f"{hf_prefix}.{hf_tail}", f"{gguf_prefix}.{gguf_tail}", group))
             continue
 
         attn_pairs = [
