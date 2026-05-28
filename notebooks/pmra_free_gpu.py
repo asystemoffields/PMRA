@@ -155,6 +155,26 @@ subprocess.run(
 import importlib
 importlib.reload(transformers)
 print(f"  after upgrade:             {transformers.__version__}")
+# Qwen3.5 has 24 DeltaNet layers — without flash-linear-attention, the model
+# falls back to a slow torch implementation (~10x slower forward pass). That
+# makes per-tensor probes take 5+ min instead of ~30s.
+#
+# Notably we do NOT install causal-conv1d here: its CUDA fast path raised
+# "Expected x.is_cuda() to be true" on Kaggle's T4. fla alone (pure-triton
+# DeltaNet) suffices and is the path that actually speeds things up.
+if cfg["tensor_profile"] == "qwen35":
+    print("  installing flash-linear-attention for fast DeltaNet...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install",
+         "flash-linear-attention", "--no-build-isolation"],
+        check=False,
+    )
+    try:
+        import fla  # noqa: F401
+        print("  fla import verified")
+    except Exception as e:
+        print(f"  WARNING: flash-linear-attention not available, probing will be slow: {e!r}")
+
 # mamba-ssm + causal-conv1d needed for NemotronH (compiles CUDA kernels — takes a few minutes)
 if cfg["tensor_profile"] == "nemotron_h":
     import torch
