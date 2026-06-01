@@ -839,6 +839,129 @@ def evaluate_nll(model, tokenizer, prompts: list[str], max_length: int) -> dict:
     return {"tokens": int(total_tokens), "nll": float(nll), "ppl": float(math.exp(nll))}
 
 
+def capture_reference_logits(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_length: int,
+    reference: str = "last_token",
+    top_k: int = 0,
+) -> list[dict | None]:
+    """Capture the (unpatched fp16) reference logit distribution per prompt, for use
+    as the ``p`` distribution in KL(fp16 || mix). Tokenizes exactly like evaluate_nll
+    (same max_length) so positions align with the probe forward.
+
+    Returns one entry per prompt (None for skipped <2-token prompts). Each entry stores
+    the full-vocab logsumexp ``lse`` so true probabilities are recoverable even when only
+    top_k logits are kept:
+      top_k == 0:  {"lse": (pos,),         "logits": (pos, vocab) fp32}
+      top_k  > 0:  {"lse": (pos,), "idx": (pos, k) i32, "val": (pos, k) fp32}
+    ``reference == "last_token"`` keeps only the final position (pos == 1).
+    """
+    device = next(model.parameters()).device
+    out_refs: list[dict | None] = []
+    with torch.inference_mode():
+        for prompt in prompts:
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+            ids = encoded.input_ids.to(device)
+            if ids.shape[-1] < 2:
+                out_refs.append(None)
+                continue
+            out = model(input_ids=ids, use_cache=False)
+            logits = out.logits[0].detach().to(torch.float32)  # (pos, vocab)
+            if reference == "last_token":
+                logits = logits[-1:, :]
+            lse = torch.logsumexp(logits, dim=-1)
+            if top_k and top_k > 0:
+                val, idx = torch.topk(logits, k=min(int(top_k), int(logits.shape[-1])), dim=-1)
+                out_refs.append({
+                    "lse": lse.cpu().numpy().astype(np.float32),
+                    "idx": idx.cpu().numpy().astype(np.int32),
+                    "val": val.cpu().numpy().astype(np.float32),
+                })
+            else:
+                out_refs.append({
+                    "lse": lse.cpu().numpy().astype(np.float32),
+                    "logits": logits.cpu().numpy().astype(np.float32),
+                })
+    return out_refs
+
+
+def _kl_ref_to_cur(ref: dict, cur: torch.Tensor, top_k: int) -> float | None:
+    """Mean-over-positions KL(p_ref || q_cur). ``cur`` is (pos, vocab) fp32 on device;
+    ``ref`` is one entry from capture_reference_logits (full logits, or top_k val/idx + lse).
+    Direction is KL(fp16 || mix): the reference (fp16) is ``p`` — "information lost going
+    fp16 -> mix". Returns None on a position-count mismatch (skip)."""
+    cur_lse = torch.logsumexp(cur, dim=-1)  # (pos,)
+    if top_k and top_k > 0:
+        idx = torch.as_tensor(ref["idx"], device=cur.device, dtype=torch.long)      # (pos, k)
+        val = torch.as_tensor(ref["val"], device=cur.device, dtype=torch.float32)   # (pos, k)
+        ref_lse = torch.as_tensor(ref["lse"], device=cur.device, dtype=torch.float32)
+        if idx.shape[0] != cur.shape[0]:
+            return None
+        logp = val - ref_lse.unsqueeze(-1)        # true log p over the top-k support
+        p = logp.exp()
+        logq = torch.gather(cur, -1, idx) - cur_lse.unsqueeze(-1)
+        kl = (p * (logp - logq)).sum(dim=-1)      # (pos,) — KL approximated over ref's support
+    else:
+        ref_logits = torch.as_tensor(ref["logits"], device=cur.device, dtype=torch.float32)
+        if ref_logits.shape[0] != cur.shape[0]:
+            return None
+        logp = torch.log_softmax(ref_logits, dim=-1)
+        p = logp.exp()
+        logq = torch.log_softmax(cur, dim=-1)
+        kl = (p * (logp - logq)).sum(dim=-1)      # (pos,)
+    return float(kl.mean().cpu())
+
+
+def evaluate_nll_kl(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_length: int,
+    ref_logits: list[dict | None],
+    reference: str = "last_token",
+    top_k: int = 0,
+) -> dict:
+    """Like evaluate_nll, but also reports mean KL(fp16 || mix) against a pre-captured
+    reference (``ref_logits`` from capture_reference_logits with the SAME
+    prompts/max_length/reference/top_k). One forward per prompt yields both NLL (from
+    out.loss) and KL (from out.logits) — no extra forward. KL is averaged over positions
+    within a prompt, then over prompts. Returns {tokens, nll, ppl, kl}."""
+    device = next(model.parameters()).device
+    total_nll = 0.0
+    total_tokens = 0
+    kl_sum = 0.0
+    kl_count = 0
+    with torch.inference_mode():
+        for idx, prompt in enumerate(prompts):
+            encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+            ids = encoded.input_ids.to(device)
+            if ids.shape[-1] < 2:
+                continue
+            out = model(input_ids=ids, labels=ids, use_cache=False)
+            count = int(ids.shape[-1] - 1)
+            total_nll += float(out.loss.detach().cpu()) * count
+            total_tokens += count
+            ref = ref_logits[idx] if idx < len(ref_logits) else None
+            if ref is None:
+                continue
+            cur = out.logits[0].detach().to(torch.float32)  # (pos, vocab)
+            if reference == "last_token":
+                cur = cur[-1:, :]
+            kl_pos = _kl_ref_to_cur(ref, cur, top_k)
+            if kl_pos is not None:
+                kl_sum += kl_pos
+                kl_count += 1
+    nll = total_nll / max(1, total_tokens)
+    return {
+        "tokens": int(total_tokens),
+        "nll": float(nll),
+        "ppl": float(math.exp(nll)),
+        "kl": float(kl_sum / max(1, kl_count)),
+    }
+
+
 def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
 
@@ -848,20 +971,26 @@ def aggregate_prompt_hash(prompts: list[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
-def build_disjoint_prompt_split(tokenizer, calib_count: int, eval_count: int, seed: int) -> tuple[list[str], list[str], dict]:
-    prompts = build_prompts(tokenizer, calib_count + eval_count, seed)
+def build_disjoint_prompt_split(tokenizer, calib_count: int, eval_count: int, seed: int, heldout_count: int = 0) -> tuple[list[str], list[str], list[str], dict]:
+    prompts = build_prompts(tokenizer, calib_count + heldout_count + eval_count, seed)
     calib_prompts = prompts[:calib_count]
-    eval_prompts = prompts[calib_count:]
+    heldout_prompts = prompts[calib_count:calib_count + heldout_count]
+    eval_prompts = prompts[calib_count + heldout_count:]
     overlap = set(calib_prompts) & set(eval_prompts)
     if overlap:
         raise AssertionError(f"calibration/eval prompt overlap detected: {len(overlap)}")
-    return calib_prompts, eval_prompts, {
+    if heldout_count and (set(heldout_prompts) & set(calib_prompts) or set(heldout_prompts) & set(eval_prompts)):
+        raise AssertionError("held-out prompts overlap calib/eval")
+    audit = {
         "split": "single_stream_disjoint",
         "seed": int(seed),
         "calib_prompt_hashes": [prompt_hash(prompt) for prompt in calib_prompts],
         "eval_prompt_hashes": [prompt_hash(prompt) for prompt in eval_prompts],
         "overlap_count": 0,
     }
+    if heldout_count:
+        audit["heldout_prompt_hashes"] = [prompt_hash(prompt) for prompt in heldout_prompts]
+    return calib_prompts, eval_prompts, heldout_prompts, audit
 
 
 def load_public_prompt_chunks(
@@ -952,8 +1081,10 @@ def public_prompt_audit(
     }
 
 
-def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], dict]:
+def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], list[str], dict]:
     seed = args.prompt_seed if args.prompt_seed is not None else args.seed + 2000
+    heldout_count = max(0, int(getattr(args, "heldout_prompts", 0)))
+    heldout_prompts: list[str] = []
     if args.calib_split == args.eval_split:
         prompts = load_public_prompt_chunks(
             tokenizer,
@@ -961,25 +1092,28 @@ def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], di
             args.dataset_config,
             args.calib_split,
             args.text_column,
-            args.calib_prompts + args.eval_prompts,
+            args.calib_prompts + heldout_count + args.eval_prompts,
             seed,
             max(args.calib_max_length, args.eval_max_length),
             args.min_tokens,
         )
         calib_prompts = prompts[: args.calib_prompts]
-        eval_prompts = prompts[args.calib_prompts :]
+        heldout_prompts = prompts[args.calib_prompts : args.calib_prompts + heldout_count]
+        eval_prompts = prompts[args.calib_prompts + heldout_count :]
     else:
-        calib_prompts = load_public_prompt_chunks(
+        calib_chunk = load_public_prompt_chunks(
             tokenizer,
             args.dataset,
             args.dataset_config,
             args.calib_split,
             args.text_column,
-            args.calib_prompts,
+            args.calib_prompts + heldout_count,
             seed,
             args.calib_max_length,
             args.min_tokens,
         )
+        calib_prompts = calib_chunk[: args.calib_prompts]
+        heldout_prompts = calib_chunk[args.calib_prompts :]
         eval_prompts = load_public_prompt_chunks(
             tokenizer,
             args.dataset,
@@ -989,6 +1123,19 @@ def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], di
             args.eval_prompts,
             seed + 17,
             args.eval_max_length,
+            args.min_tokens,
+        )
+    # optional distinct held-out split (overrides the carved slice)
+    if heldout_count > 0 and getattr(args, "heldout_split", ""):
+        heldout_prompts = load_public_prompt_chunks(
+            tokenizer,
+            args.dataset,
+            args.dataset_config,
+            args.heldout_split,
+            args.text_column,
+            heldout_count,
+            seed + 31,
+            args.calib_max_length,
             args.min_tokens,
         )
     audit = public_prompt_audit(
@@ -1007,7 +1154,12 @@ def build_public_prompt_split(tokenizer, args) -> tuple[list[str], list[str], di
     )
     if audit["overlap_count"]:
         raise AssertionError(f"calibration/eval prompt overlap detected: {audit['overlap_count']}")
-    return calib_prompts, eval_prompts, audit
+    if heldout_count > 0:
+        hset = set(heldout_prompts)
+        if hset & set(calib_prompts) or hset & set(eval_prompts):
+            raise AssertionError("held-out prompts overlap calib/eval")
+        audit["heldout_count"] = len(heldout_prompts)
+    return calib_prompts, eval_prompts, heldout_prompts, audit
 
 
 def group_weight_sse_delta(hf, model, readers: dict[str, dict], groups: dict[str, list[TensorSpec]], group: str, low: str, source: str) -> float:
@@ -1229,12 +1381,17 @@ def build_promotion_selection(
     rows: list[dict],
     budget_extra: int,
     max_states: int,
+    value_key: str = "calib_nll_improvement",
+    score_key: str = "calib_score_per_mbyte",
 ) -> list[dict]:
+    """Route a selector to a (value_key, score_key). Defaults reproduce today's
+    calib-NLL behavior; callers pass KL/held-out/domain-aggregate keys to switch
+    the allocation objective without touching select_*() (key is a parameter)."""
     selector = selector.strip()
     if selector in {"greedy", "calib_greedy"}:
-        return select_by_score(rows, budget_extra, "calib_score_per_mbyte")
+        return select_by_score(rows, budget_extra, score_key)
     if selector in {"knapsack", "calib_knapsack"}:
-        return select_knapsack_by_value(rows, budget_extra, "calib_nll_improvement", max_states)
+        return select_knapsack_by_value(rows, budget_extra, value_key, max_states)
     if selector in {"weight", "weight_mse"}:
         return select_by_score(rows, budget_extra, "weight_score_per_mbyte")
     if selector in {"blend", "calib_weight_blend"}:
@@ -2968,6 +3125,41 @@ def main() -> int:
         help="Comma-separated demotion selectors for sweeps: reverse_knapsack, reverse_greedy.",
     )
     parser.add_argument("--max-shrink-nll-loss", type=float, default=0.05)
+    # ----- PMRA objective/cost upgrade flags (every default reproduces current behavior) -----
+    parser.add_argument("--objective", choices=["calib_nll", "kl_fp16"], default="calib_nll",
+                        help="Per-tensor allocation objective. calib_nll (default)=today; kl_fp16=minimize KL(fp16||mix).")
+    parser.add_argument("--kl-reference", choices=["last_token", "full_position"], default="last_token",
+                        help="Granularity of the fp16 KL reference logits (KL objective only).")
+    parser.add_argument("--kl-top-k", type=int, default=0,
+                        help="If >0, keep only top-k reference logits per position (memory valve for full_position).")
+    parser.add_argument("--select-on", choices=["calib", "heldout"], default="calib",
+                        help="Split whose per-tensor score drives selection. 'heldout' needs --heldout-prompts>0.")
+    parser.add_argument("--heldout-prompts", type=int, default=0,
+                        help="Carve this many disjoint validation prompts (3-way split) for held-out selection. 0=off (today).")
+    parser.add_argument("--heldout-split", default="",
+                        help="Optional distinct dataset split name for the held-out validation fold.")
+    parser.add_argument("--calib-domains", default="",
+                        help="CSV name=dataset:config for multi-domain calibration (e.g. prose=wikitext:wikitext-2-raw-v1,code=...). Empty=single --dataset (today).")
+    parser.add_argument("--domain-weights", default="",
+                        help="CSV name=weight for domain aggregation (e.g. prose=0.7,code=0.3).")
+    parser.add_argument("--domain-agg", choices=["weighted_sum", "worst_case"], default="weighted_sum",
+                        help="How to aggregate per-domain improvements into the selection score.")
+    parser.add_argument("--code-no-regress", type=float, default=0.0,
+                        help="Release guardrail epsilon: code-domain NLL/KL must not exceed stock by more than this. 0=off.")
+    parser.add_argument("--triage", action="store_true",
+                        help="Enable probing-cost triage (empirically probe only top-fraction + knapsack boundary).")
+    parser.add_argument("--triage-pre-rank", choices=["weight_sse", "fisher"], default="weight_sse",
+                        help="Cheap pre-rank signal for triage.")
+    parser.add_argument("--triage-fisher-json", type=Path, default=None,
+                        help="Fisher recipe summary JSON for --triage-pre-rank fisher.")
+    parser.add_argument("--triage-probe-fraction", type=float, default=1.0,
+                        help="Fraction of candidates (by pre-rank) to empirically probe. 1.0=probe all (today).")
+    parser.add_argument("--triage-boundary-band", type=float, default=0.0,
+                        help="Force-probe candidates within this fraction of the knapsack budget boundary.")
+    parser.add_argument("--ab-objectives", default="",
+                        help="CSV of objectives to A/B (e.g. calib_nll,kl_fp16). Empty=single --objective run (today).")
+    parser.add_argument("--ab-decide-on", choices=["heldout_nll", "heldout_kl", "eval_nll"], default="heldout_nll",
+                        help="Metric that picks the A/B winner.")
     args = parser.parse_args()
     args.layers = parse_layers(args.layers)
     high_sources = parse_csv(args.high_sources)
@@ -2977,6 +3169,9 @@ def main() -> int:
     demotion_base_source = args.demotion_base_source or args.target_source
     demotion_selectors = parse_csv(args.demotion_selectors)
     source_paths = parse_source_specs(args.source)
+    # --- v2: resolve active objective(s). KL objective needs an fp16 calib reference. ---
+    ab_objectives = parse_csv(args.ab_objectives)
+    kl_active = (args.objective == "kl_fp16") or ("kl_fp16" in ab_objectives)
     required = {args.low_source, args.target_source, *high_sources, demotion_base_source, *demotion_sources}
     missing = sorted(required - set(source_paths))
     if missing:
@@ -3003,14 +3198,19 @@ def main() -> int:
     groups = group_specs(specs)
     source_payload_bytes = payload_bytes_by_source(readers, specs)
     if args.prompt_source == "public":
-        calib_prompts, eval_prompts, prompt_audit = build_public_prompt_split(tokenizer, args)
+        calib_prompts, eval_prompts, heldout_prompts, prompt_audit = build_public_prompt_split(tokenizer, args)
     else:
-        calib_prompts, eval_prompts, prompt_audit = build_disjoint_prompt_split(
+        calib_prompts, eval_prompts, heldout_prompts, prompt_audit = build_disjoint_prompt_split(
             tokenizer,
             args.calib_prompts,
             args.eval_prompts,
             args.seed + 2000,
+            heldout_count=max(0, int(getattr(args, "heldout_prompts", 0))),
         )
+    heldout_active = len(heldout_prompts) > 0
+    select_on_effective = "heldout" if (args.select_on == "heldout" and heldout_active) else "calib"
+    if args.select_on == "heldout" and not heldout_active:
+        print("[c2] WARNING: --select-on heldout requested but no held-out prompts; falling back to calib.", flush=True)
     print(
         f"[c2] prompt audit split={prompt_audit['split']} overlap_count={prompt_audit['overlap_count']}",
         flush=True,
@@ -3038,6 +3238,23 @@ def main() -> int:
         fp_last_logits = fp_eval["captured_last_logits"]
         results["fp16"] = add_byte_fields(strip_logits(fp_eval), total_weights * 2, total_weights, fp_eval["nll"])
 
+        # v2 (KL objective): capture the fp16 reference logits on the CALIB prompts while the
+        # model is still unpatched. Recomputed each run (cheap on the small calib set); used as
+        # the `p` distribution in KL(fp16 || mix) during probing. None unless KL is active.
+        calib_ref_logits = None
+        heldout_ref_logits = None
+        if kl_active:
+            print("[c2] capturing fp16 calib reference logits for KL objective", flush=True)
+            calib_ref_logits = capture_reference_logits(
+                model, tokenizer, calib_prompts, args.calib_max_length,
+                args.kl_reference, args.kl_top_k,
+            )
+            if heldout_active:
+                heldout_ref_logits = capture_reference_logits(
+                    model, tokenizer, heldout_prompts, args.calib_max_length,
+                    args.kl_reference, args.kl_top_k,
+                )
+
         print(f"[c2] patching low source {args.low_source}", flush=True)
         patch_all_from_source(model, hf, readers, args.layers, args.low_source, args.group_mode, args.tensor_profile)
         low_calib_context = {
@@ -3048,11 +3265,45 @@ def main() -> int:
             "tensor_profile": args.tensor_profile,
             "group_mode": args.group_mode,
         }
+        if kl_active:
+            # distinct checkpoint key: a KL run's low baseline carries a "kl" field
+            low_calib_context["objective"] = "kl_fp16"
+            low_calib_context["kl_reference"] = args.kl_reference
         low_calib = load_eval_checkpoint(scalar_eval_checkpoint_path, low_calib_context)
         if low_calib is None:
-            low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+            if kl_active:
+                low_calib = evaluate_nll_kl(
+                    model, tokenizer, calib_prompts, args.calib_max_length,
+                    calib_ref_logits, args.kl_reference, args.kl_top_k,
+                )
+            else:
+                low_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
             append_eval_checkpoint(scalar_eval_checkpoint_path, low_calib_context, low_calib)
         print(f"[c2] low-source calibration NLL: {low_calib['nll']:.6f}", flush=True)
+        low_heldout = None
+        if heldout_active:
+            low_heldout_context = {
+                "kind": "low_heldout",
+                "source": args.low_source,
+                "heldout_prompt_digest": prompt_digest(heldout_prompts),
+                "calib_max_length": int(args.calib_max_length),
+                "tensor_profile": args.tensor_profile,
+                "group_mode": args.group_mode,
+            }
+            if kl_active:
+                low_heldout_context["objective"] = "kl_fp16"
+                low_heldout_context["kl_reference"] = args.kl_reference
+            low_heldout = load_eval_checkpoint(scalar_eval_checkpoint_path, low_heldout_context)
+            if low_heldout is None:
+                if kl_active:
+                    low_heldout = evaluate_nll_kl(
+                        model, tokenizer, heldout_prompts, args.calib_max_length,
+                        heldout_ref_logits, args.kl_reference, args.kl_top_k,
+                    )
+                else:
+                    low_heldout = evaluate_nll(model, tokenizer, heldout_prompts, args.calib_max_length)
+                append_eval_checkpoint(scalar_eval_checkpoint_path, low_heldout_context, low_heldout)
+            print(f"[c2] low-source held-out NLL: {low_heldout['nll']:.6f}", flush=True)
 
         direct_promotion_search = args.genetic_search_direct or args.anneal_search_direct
         if direct_promotion_search:
@@ -3068,6 +3319,13 @@ def main() -> int:
                 "tensor_profile": args.tensor_profile,
                 "group_mode": args.group_mode,
             }
+            if kl_active:
+                # KL-objective probe rows live under a distinct checkpoint context so they
+                # never collide with (or get loaded as) calib-NLL rows, and vice versa.
+                allocation_context["objective"] = "kl_fp16"
+                allocation_context["kl_reference"] = args.kl_reference
+            if heldout_active:
+                allocation_context["heldout_digest"] = prompt_digest(heldout_prompts)
             allocation_rows = [
                 clean_checkpoint_row(row)
                 for row in load_jsonl_rows(allocation_checkpoint_path)
@@ -3104,7 +3362,22 @@ def main() -> int:
                     if extra <= 0:
                         continue
                     patch_group(model, hf, readers, groups, group, source)
-                    promoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                    if kl_active:
+                        promoted_calib = evaluate_nll_kl(
+                            model, tokenizer, calib_prompts, args.calib_max_length,
+                            calib_ref_logits, args.kl_reference, args.kl_top_k,
+                        )
+                    else:
+                        promoted_calib = evaluate_nll(model, tokenizer, calib_prompts, args.calib_max_length)
+                    promoted_heldout = None
+                    if heldout_active:
+                        if kl_active:
+                            promoted_heldout = evaluate_nll_kl(
+                                model, tokenizer, heldout_prompts, args.calib_max_length,
+                                heldout_ref_logits, args.kl_reference, args.kl_top_k,
+                            )
+                        else:
+                            promoted_heldout = evaluate_nll(model, tokenizer, heldout_prompts, args.calib_max_length)
                     patch_group(model, hf, readers, groups, group, args.low_source)
                     improvement = low_calib["nll"] - promoted_calib["nll"]
                     weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
@@ -3120,6 +3393,20 @@ def main() -> int:
                         "weight_sse_delta": float(weight_delta),
                         "weight_score_per_mbyte": float(weight_delta / (extra / 1_000_000)),
                     }
+                    if kl_active:
+                        # promoting low->high reduces KL(fp16||mix); improvement = KL saved
+                        kl_improvement = float(low_calib["kl"] - promoted_calib["kl"])
+                        row["kl_to_fp16"] = float(promoted_calib["kl"])
+                        row["kl_improvement"] = kl_improvement
+                        row["kl_score_per_mbyte"] = float(kl_improvement / (extra / 1_000_000))
+                    if heldout_active:
+                        h_imp = float(low_heldout["nll"] - promoted_heldout["nll"])
+                        row["heldout_nll_improvement"] = h_imp
+                        row["heldout_score_per_mbyte"] = float(h_imp / (extra / 1_000_000))
+                        if kl_active:
+                            h_kl = float(low_heldout["kl"] - promoted_heldout["kl"])
+                            row["heldout_kl_improvement"] = h_kl
+                            row["heldout_kl_score_per_mbyte"] = float(h_kl / (extra / 1_000_000))
                     allocation_rows.append(row)
                     append_jsonl_row(
                         allocation_checkpoint_path,
@@ -3244,15 +3531,30 @@ def main() -> int:
             "calib_weight_rank_blend",
             {"calib_score_per_mbyte": 0.7, "weight_score_per_mbyte": 0.3},
         )
-        calib_selected = select_by_score(allocation_rows, budget_extra, "calib_score_per_mbyte")
+        # v2: route selection to the held-out fold when requested (compression-that-generalizes).
+        # Defaults (select_on_effective == "calib") reproduce today's keys exactly.
+        nll_value_key = "heldout_nll_improvement" if select_on_effective == "heldout" else "calib_nll_improvement"
+        nll_score_key = "heldout_score_per_mbyte" if select_on_effective == "heldout" else "calib_score_per_mbyte"
+        kl_value_key = "heldout_kl_improvement" if select_on_effective == "heldout" else "kl_improvement"
+        kl_score_key = "heldout_kl_score_per_mbyte" if select_on_effective == "heldout" else "kl_score_per_mbyte"
+        calib_selected = select_by_score(allocation_rows, budget_extra, nll_score_key)
         weight_selected = select_by_score(allocation_rows, budget_extra, "weight_score_per_mbyte")
         blend_selected = select_by_score(allocation_rows, budget_extra, "calib_weight_rank_blend")
         knapsack_selected = select_knapsack_by_value(
             allocation_rows,
             budget_extra,
-            "calib_nll_improvement",
+            nll_value_key,
             args.knapsack_max_states,
         )
+        # v2: KL-objective selections (only when KL active) — recorded as distinct variants
+        # so calib-NLL and KL mixes coexist for A/B without colliding.
+        kl_knapsack_selected = None
+        kl_greedy_selected = None
+        if kl_active:
+            kl_knapsack_selected = select_knapsack_by_value(
+                allocation_rows, budget_extra, kl_value_key, args.knapsack_max_states,
+            )
+            kl_greedy_selected = select_by_score(allocation_rows, budget_extra, kl_score_key)
         raw_selections: dict[str, list[dict]] = {}
         selection_base_sources: dict[str, str] = {}
         selection_extra_budgets: dict[str, int] = {}
@@ -3292,6 +3594,9 @@ def main() -> int:
             record_selection("c2_calib_knapsack_mixed", knapsack_selected, args.low_source, budget_extra)
             record_selection("c2_weight_mse_mixed", weight_selected, args.low_source, budget_extra)
             record_selection("c2_calib_weight_blend_mixed", blend_selected, args.low_source, budget_extra)
+            if kl_active:
+                record_selection("c2_kl_knapsack_mixed", kl_knapsack_selected, args.low_source, budget_extra)
+                record_selection("c2_kl_greedy_mixed", kl_greedy_selected, args.low_source, budget_extra)
 
             for payload_bpw in sweep_payload_bpws:
                 payload_budget = int(math.floor(payload_bpw * total_weights / 8))
