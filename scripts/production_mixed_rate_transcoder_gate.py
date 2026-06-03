@@ -1226,6 +1226,39 @@ def select_by_score(rows: list[dict], budget_extra: int, score_key: str) -> list
     return selected
 
 
+def triage_select_probe_keys(
+    candidates: list[dict],
+    budget_extra: int,
+    probe_fraction: float,
+    boundary_band: float,
+) -> set:
+    """Triage: choose which (group,source) candidates earn an empirical forward probe.
+
+    Each candidate dict carries 'key', 'group', 'extra' (bytes) and 'ws' (weight
+    score per MB, the cheap no-forward signal). Rank by 'ws' and return the top
+    `probe_fraction` of candidates UNIONed with a band of width `boundary_band`
+    (a fraction of all candidates) past the greedy byte-budget cutoff. With
+    probe_fraction>=1.0 every candidate is returned, so triage reduces to full
+    probing (the v1 default path)."""
+    ranked = sorted(candidates, key=lambda c: c["ws"], reverse=True)
+    n = len(ranked)
+    seen_groups: set = set()
+    cum = 0
+    cutoff = n
+    for i, c in enumerate(ranked):
+        if c["group"] in seen_groups:
+            continue
+        seen_groups.add(c["group"])
+        cum += int(c["extra"])
+        if cum > budget_extra:
+            cutoff = i
+            break
+    top = math.ceil(n * float(probe_fraction))
+    band = math.ceil(n * float(boundary_band))
+    upto = min(n, max(top, cutoff + band))
+    return {c["key"] for c in ranked[:upto]}
+
+
 def prune_knapsack_states(
     states: list[tuple[int, float, tuple[dict, ...]]],
     max_states: int,
@@ -3326,6 +3359,11 @@ def main() -> int:
                 allocation_context["kl_reference"] = args.kl_reference
             if heldout_active:
                 allocation_context["heldout_digest"] = prompt_digest(heldout_prompts)
+            if args.triage:
+                allocation_context["triage"] = True
+                allocation_context["triage_pre_rank"] = args.triage_pre_rank
+                allocation_context["triage_probe_fraction"] = float(args.triage_probe_fraction)
+                allocation_context["triage_boundary_band"] = float(args.triage_boundary_band)
             allocation_rows = [
                 clean_checkpoint_row(row)
                 for row in load_jsonl_rows(allocation_checkpoint_path)
@@ -3343,6 +3381,38 @@ def main() -> int:
             print("[c2] scoring production-format group promotions", flush=True)
             score_idx = 0
             score_total = len(groups) * len(high_sources)
+            # --- TRIAGE pre-pass (only when --triage): a cheap weight-signal pre-rank
+            #     picks which (group,source) candidates earn an empirical forward probe.
+            #     Top --triage-probe-fraction by weight-score/MB, plus a band around the
+            #     byte-budget cutoff, are probed; the tail is proxy-zeroed. Default
+            #     (no --triage) leaves triage_probe_keys=None => probe everything (v1). ---
+            triage_probe_keys = None
+            triage_weight_cache: dict = {}
+            if args.triage:
+                if args.triage_pre_rank == "fisher":
+                    print("[c2] triage: fisher pre-rank not wired yet; using weight_sse", flush=True)
+                _tg_low = {g: group_payload_bytes(readers, groups, g, args.low_source) for g in groups}
+                _tg_budget = max(0, sum(group_payload_bytes(readers, groups, g, args.target_source)
+                                        for g in groups) - sum(_tg_low.values()))
+                _tg_cands = []
+                for _g in groups:
+                    for _s in high_sources:
+                        _extra = group_payload_bytes(readers, groups, _g, _s) - _tg_low[_g]
+                        if _extra <= 0:
+                            continue
+                        _wd = group_weight_sse_delta(hf, model, readers, groups, _g, args.low_source, _s)
+                        _k = (str(_g), str(_s))
+                        triage_weight_cache[_k] = float(_wd)
+                        _tg_cands.append({"key": _k, "group": str(_g), "extra": int(_extra),
+                                          "ws": float(_wd / (_extra / 1_000_000))})
+                triage_probe_keys = triage_select_probe_keys(
+                    _tg_cands, _tg_budget,
+                    args.triage_probe_fraction, args.triage_boundary_band,
+                )
+                print(f"[c2] triage[weight_sse]: {len(_tg_cands)} candidates, budget_extra={_tg_budget}, "
+                      f"probing {len(triage_probe_keys)} (fraction={args.triage_probe_fraction}, "
+                      f"band={args.triage_boundary_band}); proxy-zeroing "
+                      f"{len(_tg_cands) - len(triage_probe_keys)} tail", flush=True)
             for group in groups:
                 low_bytes = group_payload_bytes(readers, groups, group, args.low_source)
                 for source in high_sources:
@@ -3360,6 +3430,40 @@ def main() -> int:
                     high_bytes = group_payload_bytes(readers, groups, group, source)
                     extra = high_bytes - low_bytes
                     if extra <= 0:
+                        continue
+                    if triage_probe_keys is not None and key not in triage_probe_keys:
+                        # TRIAGE tail: no forward. Zero the forward-derived scores (selectors
+                        # skip value<=0) but keep the free weight signal for the weight selector.
+                        _twd = triage_weight_cache.get(key, 0.0)
+                        prow = {
+                            "group": group,
+                            "source": source,
+                            "low_bytes": int(low_bytes),
+                            "high_bytes": int(high_bytes),
+                            "extra_bytes": int(extra),
+                            "calib_nll": None,
+                            "calib_nll_improvement": 0.0,
+                            "calib_score_per_mbyte": 0.0,
+                            "weight_sse_delta": float(_twd),
+                            "weight_score_per_mbyte": float(_twd / (extra / 1_000_000)),
+                            "triage_proxy": True,
+                        }
+                        if kl_active:
+                            prow["kl_to_fp16"] = None
+                            prow["kl_improvement"] = 0.0
+                            prow["kl_score_per_mbyte"] = 0.0
+                        if heldout_active:
+                            prow["heldout_nll_improvement"] = 0.0
+                            prow["heldout_score_per_mbyte"] = 0.0
+                            if kl_active:
+                                prow["heldout_kl_improvement"] = 0.0
+                                prow["heldout_kl_score_per_mbyte"] = 0.0
+                        allocation_rows.append(prow)
+                        append_jsonl_row(
+                            allocation_checkpoint_path,
+                            {**prow, "_checkpoint_context": allocation_context},
+                        )
+                        seen_promotion_keys.add(key)
                         continue
                     patch_group(model, hf, readers, groups, group, source)
                     if kl_active:
@@ -3380,7 +3484,9 @@ def main() -> int:
                             promoted_heldout = evaluate_nll(model, tokenizer, heldout_prompts, args.calib_max_length)
                     patch_group(model, hf, readers, groups, group, args.low_source)
                     improvement = low_calib["nll"] - promoted_calib["nll"]
-                    weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
+                    weight_delta = triage_weight_cache.get(key)
+                    if weight_delta is None:
+                        weight_delta = group_weight_sse_delta(hf, model, readers, groups, group, args.low_source, source)
                     row = {
                         "group": group,
                         "source": source,
