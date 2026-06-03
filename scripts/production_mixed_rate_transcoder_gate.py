@@ -4071,6 +4071,38 @@ def main() -> int:
         "selections": selections,
         "variants": results,
     }
+
+    # v2 #9: A/B objective comparison. The representative knapsack variant for each
+    # requested objective was already evaluated above; pick the winner on the eval
+    # split (unseen by BOTH calib and held-out selection) and point candidate_variant
+    # at it so decide() judges the winner. Inert unless --ab-objectives is set.
+    if ab_objectives and not direct_promotion_search:
+        _obj_variant = {"calib_nll": "c2_calib_knapsack_mixed", "kl_fp16": "c2_kl_knapsack_mixed"}
+        if args.ab_decide_on != "eval_nll":
+            print(f"[c2] A/B: --ab-decide-on {args.ab_decide_on} not wired; deciding on eval_nll "
+                  "(the eval split is unseen by both calib and held-out selection).", flush=True)
+        _ab = {}
+        for _obj in ab_objectives:
+            _vn = _obj_variant.get(_obj)
+            if _vn and _vn in results:
+                _v = results[_vn]
+                _ab[_obj] = {"variant": _vn, "eval_nll": float(_v.get("nll")),
+                             "payload_bytes": int(_v.get("payload_bytes", 0))}
+        if _ab:
+            _ranked = sorted(_ab, key=lambda o: _ab[o]["eval_nll"])
+            _winner = _ranked[0]
+            _margin = (_ab[_ranked[1]]["eval_nll"] - _ab[_winner]["eval_nll"]) if len(_ranked) > 1 else None
+            result["ab_comparison"] = {
+                "decide_on": "eval_nll",
+                "objectives": _ab,
+                "winner": _winner,
+                "winner_variant": _ab[_winner]["variant"],
+                "margin": _margin,
+            }
+            result["args"]["candidate_variant"] = _ab[_winner]["variant"]
+            print(f"[c2] A/B winner (eval_nll): {_winner} -> {_ab[_winner]['variant']}"
+                  + (f" by {_margin:.6f} nats" if _margin is not None else ""), flush=True)
+
     status, decision_text, next_step = decide(result)
     result["status"] = status
     result["verdict"] = status
