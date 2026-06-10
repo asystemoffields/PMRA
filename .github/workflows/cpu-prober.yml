@@ -1,0 +1,190 @@
+# PMRA CPU prober — free-CPU probing on GitHub Actions.
+#
+# Fan-out: a prepare job computes the imatrix + tier-1 proxy scores once,
+# then a matrix of shard jobs runs the tier-2 llama-perplexity probes in
+# parallel, and a finalize job merges the allocation rows, solves the final
+# knapsack, and uploads result.json (+ the mixed GGUF artifact).
+#
+# Sized for small models (<=1B): each job downloads the full GGUF spread.
+# For 4B+ use the Kaggle CPU-kernel harness (notebooks/pmra_cpu_prober_kaggle.py)
+# which has the disk for it — GHA runners only have ~14 GB free.
+
+name: cpu-prober
+
+on:
+  workflow_dispatch:
+    inputs:
+      gguf_repo:
+        description: HF repo with the GGUF quant spread
+        default: bartowski/SmolLM2-135M-Instruct-GGUF
+      gguf_prefix:
+        description: GGUF filename prefix
+        default: SmolLM2-135M-Instruct
+      low_source:
+        default: q2_k
+      target_source:
+        default: q4_k_m
+      high_sources:
+        default: iq3_m,q3_k_m,q3_k_l,iq4_xs,q8_0
+      ref_source:
+        default: f16
+      shards:
+        description: Number of tier-2 probe shards
+        default: "4"
+      max_probes:
+        default: "48"
+
+env:
+  LLAMA_CPP_RELEASE_FILTER: bin-ubuntu-x64
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      shard_list: ${{ steps.shards.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: pip install -q gguf numpy "huggingface_hub[hf_xet]" datasets
+      - name: Fetch llama.cpp release binaries
+        run: |
+          url=$(gh api repos/ggml-org/llama.cpp/releases/latest \
+            --jq ".assets[] | select(.name | contains(\"$LLAMA_CPP_RELEASE_FILTER\")) | .browser_download_url" | head -1)
+          curl -sL "$url" -o llama.zip && unzip -q llama.zip -d llama-bin
+          echo "LLAMA_BIN=$(dirname $(find llama-bin -name llama-perplexity | head -1))" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Download GGUFs + corpus
+        run: python .github/scripts/fetch_prober_inputs.py
+        env:
+          GGUF_REPO: ${{ inputs.gguf_repo }}
+          GGUF_PREFIX: ${{ inputs.gguf_prefix }}
+          SOURCES: ${{ inputs.low_source }},${{ inputs.target_source }},${{ inputs.high_sources }},${{ inputs.ref_source }}
+      - name: Tier 0+1 (imatrix + proxy scores)
+        run: |
+          python scripts/cpu_prober.py $(cat work/source_args.txt) \
+            --low-source "${{ inputs.low_source }}" --target-source "${{ inputs.target_source }}" \
+            --high-sources "${{ inputs.high_sources }}" --ref-source "${{ inputs.ref_source }}" \
+            --calib-text work/calib.txt --eval-text work/eval.txt \
+            --output-dir out --llama-bin "$LLAMA_BIN" \
+            --max-probes "${{ inputs.max_probes }}" --stages tier1
+          ls -la out/checkpoints out/work
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepare-checkpoints
+          path: |
+            out/checkpoints
+            out/work/imatrix.gguf
+      - id: shards
+        run: |
+          n="${{ inputs.shards }}"
+          echo "list=$(python -c "import json;print(json.dumps(list(range($n))))")" >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: ${{ fromJson(needs.prepare.outputs.shard_list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: pip install -q gguf numpy "huggingface_hub[hf_xet]" datasets
+      - name: Fetch llama.cpp release binaries
+        run: |
+          url=$(gh api repos/ggml-org/llama.cpp/releases/latest \
+            --jq ".assets[] | select(.name | contains(\"$LLAMA_CPP_RELEASE_FILTER\")) | .browser_download_url" | head -1)
+          curl -sL "$url" -o llama.zip && unzip -q llama.zip -d llama-bin
+          echo "LLAMA_BIN=$(dirname $(find llama-bin -name llama-perplexity | head -1))" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Download GGUFs + corpus
+        run: python .github/scripts/fetch_prober_inputs.py
+        env:
+          GGUF_REPO: ${{ inputs.gguf_repo }}
+          GGUF_PREFIX: ${{ inputs.gguf_prefix }}
+          SOURCES: ${{ inputs.low_source }},${{ inputs.target_source }},${{ inputs.high_sources }},${{ inputs.ref_source }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: prepare-checkpoints
+          path: out
+      - name: Tier 2 probes (shard ${{ matrix.shard }})
+        run: |
+          python scripts/cpu_prober.py $(cat work/source_args.txt) \
+            --low-source "${{ inputs.low_source }}" --target-source "${{ inputs.target_source }}" \
+            --high-sources "${{ inputs.high_sources }}" --ref-source "${{ inputs.ref_source }}" \
+            --imatrix out/work/imatrix.gguf \
+            --calib-text work/calib.txt --eval-text work/eval.txt \
+            --output-dir out --llama-bin "$LLAMA_BIN" \
+            --max-probes "${{ inputs.max_probes }}" \
+            --stages tier2 --shard "${{ matrix.shard }}/${{ inputs.shards }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rows-shard-${{ matrix.shard }}
+          path: out/checkpoints/allocation_rows.jsonl
+
+  finalize:
+    needs: probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps (torch CPU for the artifact builder)
+        run: |
+          pip install -q gguf numpy "huggingface_hub[hf_xet]" datasets
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q transformers safetensors
+      - name: Fetch llama.cpp release binaries
+        run: |
+          url=$(gh api repos/ggml-org/llama.cpp/releases/latest \
+            --jq ".assets[] | select(.name | contains(\"$LLAMA_CPP_RELEASE_FILTER\")) | .browser_download_url" | head -1)
+          curl -sL "$url" -o llama.zip && unzip -q llama.zip -d llama-bin
+          echo "LLAMA_BIN=$(dirname $(find llama-bin -name llama-perplexity | head -1))" >> "$GITHUB_ENV"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Download GGUFs + corpus
+        run: python .github/scripts/fetch_prober_inputs.py
+        env:
+          GGUF_REPO: ${{ inputs.gguf_repo }}
+          GGUF_PREFIX: ${{ inputs.gguf_prefix }}
+          SOURCES: ${{ inputs.low_source }},${{ inputs.target_source }},${{ inputs.high_sources }},${{ inputs.ref_source }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: prepare-checkpoints
+          path: out
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rows-shard-*
+          path: shards
+      - name: Merge shard rows
+        run: |
+          python scripts/merge_allocation_rows.py shards out/checkpoints \
+            --output out/checkpoints/allocation_rows.jsonl
+      - name: Finalize (knapsack + result.json + controls)
+        run: |
+          python scripts/cpu_prober.py $(cat work/source_args.txt) \
+            --low-source "${{ inputs.low_source }}" --target-source "${{ inputs.target_source }}" \
+            --high-sources "${{ inputs.high_sources }}" --ref-source "${{ inputs.ref_source }}" \
+            --imatrix out/work/imatrix.gguf \
+            --calib-text work/calib.txt --eval-text work/eval.txt \
+            --output-dir out --llama-bin "$LLAMA_BIN" \
+            --max-probes "${{ inputs.max_probes }}" --stages finalize
+      - name: Build mixed GGUF artifact
+        run: |
+          cd scripts && python build_mixed_gguf_artifact.py \
+            --result-json ../out/result.json \
+            --output-dir ../out/artifact \
+            --output-gguf pmra-mix.gguf \
+            --variant c2_calib_knapsack_mixed \
+            $(cat ../work/source_args.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pmra-result
+          path: |
+            out/result.json
+            out/artifact
