@@ -87,6 +87,29 @@ emits a partial `allocation_rows.jsonl`; merge with
 | `--ctx` / `--chunks` | 512 / 24 | llama-perplexity window: 12k tokens per probe |
 | `--ref-source` | f16 if present | tier-1 reference; use q8_0 at 4B+ to keep the imatrix run fast |
 
+## Hessian-sketch Tier 1 (optional, stronger proxy)
+
+`scripts/hessian_scorer.py` replaces the imatrix-SSE proxy with an analytic
+K-FAC-style expansion: one forward+backward over the calibration tokens
+captures full per-site input covariances A (the imatrix is diag(A)),
+output-gradient second moments G, and weight gradients; every candidate is
+then scored as `<grad, dW> + 1/2 sum_i G_ii (dW A dW^T)_ii` with no further
+forwards. On SmolLM2-135M this doubled rank fidelity against 130 empirical
+llama.cpp probes (Spearman 0.62 vs 0.33 for imatrix-SSE). Needs torch + the
+HF model (CPU is fine); ~10 min capture at 135M.
+
+Integration is file-level: the output is tier1_scores.json-compatible, so
+
+```bash
+python scripts/hessian_scorer.py --model-dir <hf> ... --output out/checkpoints/tier1_scores.json
+python scripts/cpu_prober.py ...   # consumes it as the Tier-1 cache
+```
+
+Groups the scorer doesn't cover (global embed/output) are filled with
+imatrix-SSE by the prober; note the units differ across the two scorers, so
+cross-group proxy rankings mix scales for those globals (they are rarely
+viable candidates — embeddings ship at Q8_0 in most published spreads).
+
 ## Verdict semantics
 
 `GO` — mix beats the target uniform quant NLL **and** the random-same-budget
