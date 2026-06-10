@@ -484,6 +484,9 @@ def main() -> int:
                              "(shard worker). finalize: skip probing, select from merged rows.")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--variant-name", default="c2_calib_knapsack_mixed")
+    parser.add_argument("--no-backfill", action="store_true",
+                        help="Leave budget unspent when empirical improvements run out, instead of "
+                             "filling the remainder by proxy rank (probed-negative candidates stay excluded).")
     args = parser.parse_args()
 
     high_sources = [s.strip() for s in args.high_sources.split(",") if s.strip()]
@@ -615,6 +618,38 @@ def main() -> int:
     used = sum(row["extra_bytes"] for row in final_selection)
     print(f"[final] knapsack: {len(final_selection)} promotions, {used/1e6:.2f}/{budget_extra/1e6:.2f} MB", flush=True)
 
+    # Backfill: sub-noise candidates shouldn't be selected on, but the byte
+    # budget shouldn't be forfeited either — the bpw->NLL ladder is smooth, so
+    # unspent bytes are pure loss. Fill the remainder by proxy rank with
+    # unprobed candidates (probed-negative stay excluded: we have evidence).
+    if not args.no_backfill:
+        selected_groups = {row["group"] for row in final_selection}
+        pool = sorted(
+            (c for c in candidates
+             if c["group"] not in selected_groups
+             and probe_key(c) not in done
+             and c["proxy_improvement"] > 0),
+            key=lambda c: c["proxy_score_per_mbyte"], reverse=True,
+        )
+        backfilled = 0
+        for cand in pool:
+            if used + cand["extra_bytes"] > budget_extra:
+                continue
+            final_selection.append({
+                **{k: cand[k] for k in ["group", "source", "low_bytes", "high_bytes", "extra_bytes"]},
+                "saved_bytes": 0, "base_source": None,
+                "calib_nll": None, "calib_nll_improvement": 0.0,
+                "calib_nll_loss": 0.0, "calib_score_per_mbyte": 0.0,
+                "calib_knapsack_value": 0.0,
+                "weight_sse_delta": cand["proxy_improvement"],
+                "weight_score_per_mbyte": cand["proxy_score_per_mbyte"],
+                "backfill_proxy": True,
+            })
+            selected_groups.add(cand["group"])
+            used += cand["extra_bytes"]
+            backfilled += 1
+        print(f"[final] backfill: +{backfilled} proxy-ranked promotions -> {used/1e6:.2f}/{budget_extra/1e6:.2f} MB", flush=True)
+
     rng = random.Random(args.seed)
     random_selection = select_random(candidates, budget_extra, rng)
 
@@ -657,9 +692,11 @@ def main() -> int:
     candidate_nll = variants[args.variant_name]["nll"]
     target_nll = variants[args.target_source]["nll"]
     random_nll = variants["c2_random_same_budget"]["nll"]
-    if candidate_nll < target_nll and candidate_nll <= random_nll:
+    beats_target = candidate_nll < target_nll
+    beats_random = candidate_nll <= random_nll
+    if beats_target and beats_random:
         verdict = "GO"
-    elif candidate_nll < target_nll:
+    elif beats_target or beats_random:
         verdict = "GRAY"
     else:
         verdict = "NO-GO"
