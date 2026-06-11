@@ -118,7 +118,9 @@ import glob
 
 ckpt = OUT / "checkpoints"
 ckpt.mkdir(parents=True, exist_ok=True)
-shard_rows = glob.glob("/kaggle/input/**/checkpoints/allocation_rows.jsonl", recursive=True)
+# match anywhere under input: kernel_sources mount under .../output/checkpoints/,
+# but Dataset zip extraction may flatten the carrying folder
+shard_rows = glob.glob("/kaggle/input/**/allocation_rows.jsonl", recursive=True)
 if shard_rows:
     subprocess.run([sys.executable, str(PMRA / "scripts" / "merge_allocation_rows.py"),
                     *shard_rows, "--output", str(ckpt / "allocation_rows.jsonl")], check=True)
