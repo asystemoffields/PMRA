@@ -35,6 +35,21 @@ GGUF is assembled by payload splicing and measured with `llama-perplexity`
 on the calibration text. The final knapsack runs on empirical improvements
 only; the unprobed tail is proxy-zeroed, mirroring `--triage` semantics.
 
+**Early stopping (default on):** probes are scored as the *paired* per-chunk
+NLL delta against the low base (recovered from llama-perplexity's running
+`[k]ppl` progress), which has far lower variance than comparing absolute
+NLLs. Each probe stops as soon as its 95% CI half-width drops below
+`max(--probe-se-stop, --probe-rel-stop × |improvement|)` or the improvement
+is clearly negative — typically 8 chunks instead of 24 for sub-noise and
+clearly-bad candidates, a ~2-3× tier-2 speedup with no decision-quality
+loss. The paired mean telescopes (only the final printed PPL matters), so
+the printed 4-decimal precision does not accumulate error. Disable with
+`--no-probe-early-stop`. Requires per-chunk NLLs for the low base; the
+prober captures these automatically. If a carried `scalar_evals.jsonl`
+checkpoint from an older build lacks them, the low-base calibration eval is
+re-measured once (only in probe-running stages) rather than silently
+degrading every probe to full-length.
+
 Outputs are drop-in compatible with the existing toolchain:
 
 - `checkpoints/allocation_rows.jsonl` — same row keys and the same
@@ -71,7 +86,7 @@ emits a partial `allocation_rows.jsonl`; merge with
 
 - **GitHub Actions** (`.github/workflows/cpu-prober.yml`): prepare →
   N-way probe matrix → finalize, all on free public-repo runners. Sized for
-  ≤1B models (runners have ~14 GB disk).
+  ≤1B models (runners have ~14 GB disk). Default 8 shards.
 - **Kaggle CPU kernels** (`notebooks/pmra_cpu_prober_kaggle.py`): no GPU
   quota consumed, big disk via mounted GGUF Datasets, concurrent sessions.
   This is the path for 4B+ models. Shard fan-in reuses the kernel_sources
@@ -84,7 +99,11 @@ emits a partial `allocation_rows.jsonl`; merge with
 | `--probe-fraction` | 0.15 | Tier-2 probes the top fraction of candidates by proxy score/MB |
 | `--boundary-band` | 0.10 | plus this band past the greedy budget cutoff |
 | `--max-probes` | 48 | hard cap on tier-2 probes (proxy-selection members first) |
-| `--ctx` / `--chunks` | 512 / 24 | llama-perplexity window: 12k tokens per probe |
+| `--ctx` / `--chunks` | 512 / 24 | llama-perplexity window: 12k tokens per probe (max; early stopping may use fewer chunks) |
+| `--probe-min-chunks` | 8 | minimum chunks before a probe may stop early |
+| `--probe-se-stop` | 0.001 | absolute CI half-width (nats) at which a probe stops |
+| `--probe-rel-stop` | 0.10 | ...or this fraction of \|improvement\| for large deltas |
+| `--no-probe-early-stop` | off | always run probes for the full `--chunks` |
 | `--ref-source` | f16 if present | tier-1 reference; use q8_0 at 4B+ to keep the imatrix run fast |
 
 ## Hessian-sketch Tier 1 (optional, stronger proxy)

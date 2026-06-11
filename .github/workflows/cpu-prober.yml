@@ -30,7 +30,7 @@ on:
         default: f16
       shards:
         description: Number of tier-2 probe shards
-        default: "4"
+        default: "8"
       max_probes:
         default: "48"
 

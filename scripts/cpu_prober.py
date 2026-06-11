@@ -189,7 +189,123 @@ def run_perplexity(bin_dir: Path, gguf: Path, text: Path, ctx: int, chunks: int,
     if not match:
         raise RuntimeError(f"llama-perplexity gave no PPL for {gguf.name} (exit {proc.returncode}):\n{output[-2000:]}")
     ppl = float(match.group(1))
-    return {"ppl": ppl, "nll": math.log(ppl), "tokens": ctx * chunks}
+    result = {"ppl": ppl, "nll": math.log(ppl), "tokens": ctx * chunks}
+    # The "calculating perplexity" marker logs to stderr while the [k]ppl
+    # progress prints to stdout, so try stderr-first ordering too.
+    cum = (_parse_cumulative_ppls(proc.stderr + proc.stdout)
+           or _parse_cumulative_ppls(output))
+    if cum:
+        result["chunk_nlls"] = chunk_nlls_from_cumulative(cum)
+    return result
+
+
+# Running per-chunk progress, e.g. "[1]4.6043,[2]4.9871,...". Only valid after
+# the "calculating perplexity over N chunks" marker (model-load logs also
+# contain bracketed numbers).
+_CHUNK_PROGRESS_RE = re.compile(r"\[(\d+)\](\d+\.\d+)")
+_CHUNK_START_MARKER = "calculating perplexity over"
+
+
+def _parse_cumulative_ppls(output: str) -> list[float]:
+    start = output.find(_CHUNK_START_MARKER)
+    if start < 0:
+        return []
+    cum: list[float] = []
+    for match in _CHUNK_PROGRESS_RE.finditer(output, start):
+        if int(match.group(1)) == len(cum) + 1:  # accept only the monotone sequence
+            cum.append(float(match.group(2)))
+    return cum
+
+
+def chunk_nlls_from_cumulative(cum: list[float]) -> list[float]:
+    """Recover per-chunk mean NLLs from llama-perplexity's running PPL values."""
+    out, prev_total = [], 0.0
+    for k, ppl in enumerate(cum, start=1):
+        total = k * math.log(ppl)
+        out.append(total - prev_total)
+        prev_total = total
+    return out
+
+
+def paired_probe_stats(base_chunk_nlls: list[float], cum_ppls: list[float]) -> tuple[float, float]:
+    """(mean_improvement, standard_error) of the paired per-chunk NLL delta
+    base - probe over the chunks seen so far. The mean telescopes to
+    mean(base[:k]) - log(cum_ppl_k), so printed-precision rounding does not
+    accumulate; per-chunk rounding noise only enters the variance estimate."""
+    k = len(cum_ppls)
+    mean = sum(base_chunk_nlls[:k]) / k - math.log(cum_ppls[-1])
+    if k < 2:
+        return mean, float("inf")
+    deltas = [b - p for b, p in zip(base_chunk_nlls[:k], chunk_nlls_from_cumulative(cum_ppls))]
+    var = sum((d - mean) ** 2 for d in deltas) / (k - 1)
+    return mean, (var / k) ** 0.5
+
+
+def run_perplexity_early_stop(
+    bin_dir: Path,
+    gguf: Path,
+    text: Path,
+    ctx: int,
+    chunks: int,
+    threads: int,
+    base_chunk_nlls: list[float],
+    min_chunks: int,
+    se_stop: float,
+    rel_stop: float = 0.10,
+) -> dict:
+    """Tier-2 probe evaluation with sequential stopping on the paired
+    per-chunk delta vs the low base. Stops once the 95% CI half-width of the
+    mean improvement drops below max(se_stop, rel_stop*|mean|) — an absolute
+    floor for sub-noise candidates, relative precision for large deltas — or
+    once the improvement is clearly negative; either way the estimate stays
+    usable by the knapsack."""
+    cmd = [
+        str(bin_dir / "llama-perplexity"),
+        "-m", str(gguf),
+        "-f", str(text),
+        "--ctx-size", str(ctx),
+        "--chunks", str(chunks),
+        "-t", str(threads),
+        "--no-warmup",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    fd = proc.stdout.fileno()
+    buf = b""
+    cum: list[float] = []
+    early_stopped = False
+    try:
+        while True:
+            data = os.read(fd, 4096)
+            if not data:
+                break
+            buf += data
+            parsed = _parse_cumulative_ppls(buf.decode("utf-8", errors="replace"))
+            if len(parsed) <= len(cum):
+                continue
+            cum = parsed
+            k = len(cum)
+            if k < min_chunks or k > len(base_chunk_nlls):
+                continue
+            mean, se = paired_probe_stats(base_chunk_nlls, cum)
+            half_width = 1.96 * se
+            if half_width < max(se_stop, rel_stop * abs(mean)) or mean + half_width < 0:
+                early_stopped = True
+                proc.kill()
+                break
+    finally:
+        proc.wait()
+    if not cum:
+        output = buf.decode("utf-8", errors="replace")
+        raise RuntimeError(f"llama-perplexity gave no chunk progress for {gguf.name} "
+                           f"(exit {proc.returncode}):\n{output[-2000:]}")
+    mean, se = paired_probe_stats(base_chunk_nlls, cum)
+    return {
+        "improvement": mean,
+        "improvement_se": se,
+        "chunks_used": len(cum),
+        "early_stopped": early_stopped,
+        "tokens": ctx * len(cum),
+    }
 
 
 def run_imatrix(bin_dir: Path, gguf: Path, text: Path, out: Path, ctx: int, threads: int) -> Path:
@@ -478,6 +594,16 @@ def main() -> int:
     parser.add_argument("--probe-fraction", type=float, default=0.15)
     parser.add_argument("--boundary-band", type=float, default=0.10)
     parser.add_argument("--max-probes", type=int, default=48)
+    parser.add_argument("--probe-min-chunks", type=int, default=8,
+                        help="Minimum chunks before a tier-2 probe may stop early.")
+    parser.add_argument("--probe-se-stop", type=float, default=0.001,
+                        help="Stop a probe once the 95%% CI half-width of the paired "
+                             "improvement estimate (nats) drops below this.")
+    parser.add_argument("--probe-rel-stop", type=float, default=0.10,
+                        help="...or below this fraction of |improvement| (relative "
+                             "precision for large deltas).")
+    parser.add_argument("--no-probe-early-stop", action="store_true",
+                        help="Always run tier-2 probes for the full --chunks.")
     parser.add_argument("--shard", default=None, help="k/N: only run tier-2 probes whose hash lands in shard k (0-based).")
     parser.add_argument("--stages", default="all", choices=["all", "tier1", "tier2", "finalize"],
                         help="tier1: stop after proxy scoring (prepare job). tier2: stop after probes "
@@ -526,10 +652,13 @@ def main() -> int:
     scalar_path = ckpt_dir / "scalar_evals.jsonl"
     scalar_cache = {row["label"]: row for row in (json.loads(l) for l in scalar_path.read_text().splitlines())} if scalar_path.exists() else {}
 
-    def eval_gguf(label: str, gguf: Path, text: Path, tag: str) -> dict:
+    def eval_gguf(label: str, gguf: Path, text: Path, tag: str, require_chunks: bool = False) -> dict:
         key = f"{label}@{tag}"
-        if key in scalar_cache:
-            return scalar_cache[key]
+        cached = scalar_cache.get(key)
+        if cached is not None and not (require_chunks and "chunk_nlls" not in cached):
+            return cached
+        if cached is not None:
+            print(f"[tier0] cached {key} lacks per-chunk NLLs (older build); re-measuring", flush=True)
         print(f"[tier0] llama-perplexity {label} on {text.name}", flush=True)
         result = run_perplexity(args.llama_bin, gguf, text, args.ctx, args.chunks, args.threads)
         row = {"label": key, **result}
@@ -537,7 +666,17 @@ def main() -> int:
         append_row(scalar_path, row)
         return row
 
-    nll_low = eval_gguf(args.low_source, source_paths[args.low_source], args.calib_text, "calib")["nll"]
+    # Paired early stopping needs the low base's per-chunk NLLs; finalize never
+    # probes, so a chunk-less cached row only forces a re-measure when this
+    # invocation will actually run tier-2 probes.
+    need_chunks = args.stages in ("all", "tier2") and not args.no_probe_early_stop
+    low_calib = eval_gguf(args.low_source, source_paths[args.low_source], args.calib_text, "calib",
+                          require_chunks=need_chunks)
+    nll_low = low_calib["nll"]
+    base_chunk_nlls = low_calib.get("chunk_nlls")
+    if not args.no_probe_early_stop and not base_chunk_nlls:
+        print("[tier0] cached low-source eval has no per-chunk NLLs; "
+              "tier-2 probes will run full-length", flush=True)
 
     # ---- Tier 1: proxy ----------------------------------------------------
     imatrix_path = args.imatrix
@@ -582,13 +721,26 @@ def main() -> int:
                 {name: cand["source"] for name in groups[cand["group"]]},
                 args.low_source,
             )
-            result = run_perplexity(args.llama_bin, probe_gguf, args.calib_text, args.ctx, args.chunks, args.threads)
-            improvement = nll_low - result["nll"]
+            if base_chunk_nlls and not args.no_probe_early_stop:
+                probe = run_perplexity_early_stop(
+                    args.llama_bin, probe_gguf, args.calib_text, args.ctx, args.chunks,
+                    args.threads, base_chunk_nlls, args.probe_min_chunks,
+                    args.probe_se_stop, args.probe_rel_stop)
+                improvement = probe["improvement"]
+                probe_meta = {
+                    "probe_chunks": probe["chunks_used"],
+                    "probe_early_stopped": probe["early_stopped"],
+                    "probe_improvement_se": probe["improvement_se"],
+                }
+            else:
+                result = run_perplexity(args.llama_bin, probe_gguf, args.calib_text, args.ctx, args.chunks, args.threads)
+                improvement = nll_low - result["nll"]
+                probe_meta = {"probe_chunks": args.chunks, "probe_early_stopped": False}
             row = {
                 **{k: cand[k] for k in ["group", "source", "low_bytes", "high_bytes", "extra_bytes"]},
                 "saved_bytes": 0,
                 "base_source": None,
-                "calib_nll": result["nll"],
+                "calib_nll": nll_low - improvement,
                 "calib_nll_improvement": improvement,
                 "calib_nll_loss": max(0.0, -improvement),
                 "calib_score_per_mbyte": improvement / (cand["extra_bytes"] / 1_000_000),
@@ -596,10 +748,12 @@ def main() -> int:
                 "weight_sse_delta": cand["proxy_improvement"],
                 "weight_score_per_mbyte": cand["proxy_score_per_mbyte"],
                 "probe_backend": "llama_cpp_cpu",
+                **probe_meta,
             }
             done[probe_key(row)] = row
             append_row(rows_path, row)
-            print(f"[tier2] {idx}/{len(todo)} {row['group']} <- {row['source']}: dNLL={improvement:+.5f}", flush=True)
+            print(f"[tier2] {idx}/{len(todo)} {row['group']} <- {row['source']}: dNLL={improvement:+.5f}"
+                  f" ({row['probe_chunks']} chunks{' early-stop' if row['probe_early_stopped'] else ''})", flush=True)
         if probe_gguf.exists():
             probe_gguf.unlink()
         if args.stages == "tier2":

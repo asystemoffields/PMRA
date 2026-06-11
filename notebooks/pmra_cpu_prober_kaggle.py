@@ -6,7 +6,8 @@
 # GPU cap), ~100 GB working disk via mounted Datasets, and allow concurrent
 # sessions — so tier-2 probing shards horizontally across kernels.
 #
-# **Sharding:** set `SHARD = "k/N"` (e.g. "0/4") and launch N copies of this
+# **Sharding:** set `SHARD = "k/N"` (e.g. "0/8"; 8 shards is the sweet spot —
+# Kaggle allows ~10 concurrent CPU sessions) and launch N copies of this
 # kernel (Save Version → Save & Run All on N forks). Each writes a partial
 # `checkpoints/allocation_rows.jsonl`. A final kernel (or local run) with
 # `SHARD = None, STAGES = "finalize"` mounts the shard outputs via
