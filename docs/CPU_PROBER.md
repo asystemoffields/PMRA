@@ -45,8 +45,10 @@ clearly-bad candidates, a ~2-3× tier-2 speedup with no decision-quality
 loss. The paired mean telescopes (only the final printed PPL matters), so
 the printed 4-decimal precision does not accumulate error. Disable with
 `--no-probe-early-stop`. Requires per-chunk NLLs for the low base; the
-prober captures these automatically, but `scalar_evals.jsonl` checkpoints
-from older builds lack them, in which case probes silently run full-length.
+prober captures these automatically. If a carried `scalar_evals.jsonl`
+checkpoint from an older build lacks them, the low-base calibration eval is
+re-measured once (only in probe-running stages) rather than silently
+degrading every probe to full-length.
 
 Outputs are drop-in compatible with the existing toolchain:
 

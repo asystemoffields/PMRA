@@ -652,10 +652,13 @@ def main() -> int:
     scalar_path = ckpt_dir / "scalar_evals.jsonl"
     scalar_cache = {row["label"]: row for row in (json.loads(l) for l in scalar_path.read_text().splitlines())} if scalar_path.exists() else {}
 
-    def eval_gguf(label: str, gguf: Path, text: Path, tag: str) -> dict:
+    def eval_gguf(label: str, gguf: Path, text: Path, tag: str, require_chunks: bool = False) -> dict:
         key = f"{label}@{tag}"
-        if key in scalar_cache:
-            return scalar_cache[key]
+        cached = scalar_cache.get(key)
+        if cached is not None and not (require_chunks and "chunk_nlls" not in cached):
+            return cached
+        if cached is not None:
+            print(f"[tier0] cached {key} lacks per-chunk NLLs (older build); re-measuring", flush=True)
         print(f"[tier0] llama-perplexity {label} on {text.name}", flush=True)
         result = run_perplexity(args.llama_bin, gguf, text, args.ctx, args.chunks, args.threads)
         row = {"label": key, **result}
@@ -663,10 +666,13 @@ def main() -> int:
         append_row(scalar_path, row)
         return row
 
-    low_calib = eval_gguf(args.low_source, source_paths[args.low_source], args.calib_text, "calib")
+    # Paired early stopping needs the low base's per-chunk NLLs; finalize never
+    # probes, so a chunk-less cached row only forces a re-measure when this
+    # invocation will actually run tier-2 probes.
+    need_chunks = args.stages in ("all", "tier2") and not args.no_probe_early_stop
+    low_calib = eval_gguf(args.low_source, source_paths[args.low_source], args.calib_text, "calib",
+                          require_chunks=need_chunks)
     nll_low = low_calib["nll"]
-    # Per-chunk base NLLs enable paired early-stopping probes. Absent from
-    # scalar_evals.jsonl rows cached by older builds -> probes run full-length.
     base_chunk_nlls = low_calib.get("chunk_nlls")
     if not args.no_probe_early_stop and not base_chunk_nlls:
         print("[tier0] cached low-source eval has no per-chunk NLLs; "
