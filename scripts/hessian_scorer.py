@@ -69,15 +69,30 @@ FAMILY = {"attn_q": "attn", "attn_k": "attn", "attn_v": "attn", "attn_output": "
 
 
 def find_targets(model, families: set[str]) -> dict[str, torch.nn.Module]:
-    """Map "layer_idx|hf_tail" -> linear module for the requested families."""
-    targets: dict[str, torch.nn.Module] = {}
+    """Map "layer_idx|hf_tail" -> linear module for the requested families.
+
+    Matches any "...layers.<N>.<tail>" path so multimodal checkpoints
+    (text stack under language_model.layers.*) work; if a language_model/
+    text_model stack exists, vision-tower matches are dropped — GGUF blk.N
+    tensors correspond to the text layers only.
+    """
+    matches: dict[str, tuple[str, str, torch.nn.Module]] = {}
     for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
         parts = name.split(".")
-        if len(parts) >= 4 and parts[0] == "model" and parts[1] == "layers":
-            tail = ".".join(parts[3:])
-            if tail in HF_TO_GGUF and isinstance(module, torch.nn.Linear):
-                if FAMILY[HF_TO_GGUF[tail]] in families:
-                    targets[f"{parts[2]}|{tail}"] = module
+        for i, seg in enumerate(parts):
+            if seg == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                tail = ".".join(parts[i + 2:])
+                if tail in HF_TO_GGUF and FAMILY[HF_TO_GGUF[tail]] in families:
+                    matches[name] = (parts[i + 1], tail, module)
+                break
+    lm_only = {n: v for n, v in matches.items() if "language_model" in n or "text_model" in n}
+    if lm_only:
+        matches = lm_only
+    targets = {f"{layer}|{tail}": module for layer, tail, module in matches.values()}
+    if len(targets) != len(matches):
+        raise RuntimeError("duplicate layer|tail keys across module stacks; refusing to mix")
     return targets
 
 
@@ -174,8 +189,13 @@ def main() -> int:
 
     torch.set_num_threads(args.threads)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir, torch_dtype=getattr(torch, args.dtype)).eval()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir, torch_dtype=getattr(torch, args.dtype)).eval()
+    except ValueError:  # multimodal checkpoints (e.g. qwen3_5 image-text-to-text)
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model_dir, torch_dtype=getattr(torch, args.dtype)).eval()
     all_targets = find_targets(model, families)
     if not all_targets:
         raise RuntimeError(f"no target linears matched families={sorted(families)}; "
