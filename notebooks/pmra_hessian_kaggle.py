@@ -16,8 +16,11 @@ MODEL = {
     "highs": "q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_m",
 }
 FAMILIES = "mlp"        # empirical 4B probe set is all-MLP; DeltaNet layers have no self_attn.*
-CAPTURE_PASSES = 6      # qwen3_5 is multimodal: ~18.6 GB fp32 with the vision tower; keep cov+grads small
-CTX, CHUNKS = 512, 24   # match the empirical probe windows
+CAPTURE_PASSES = 3      # cov RAM ~4.5 GB per 12-layer pass; checkpointing bounds the graph
+DTYPE = "float32"       # bf16 matmul is ~250x slower on CPUs without AVX512-BF16/AMX
+CTX, CHUNKS = 512, 12   # rank validation tolerates sqrt(2) more SE; halves capture time
+# v1 postmortem: fp32 with no checkpointing built a full-depth graph on pass 1
+# and swapped the 30 GB kernel to death (7.6h for one chunk).
 # ==================================================
 
 import glob, os, subprocess, sys
@@ -90,6 +93,7 @@ cmd = [
     "--ctx", str(CTX), "--chunks", str(CHUNKS),
     "--threads", str(os.cpu_count() or 4),
     "--families", FAMILIES, "--capture-passes", str(CAPTURE_PASSES),
+    "--dtype", DTYPE, "--gradient-checkpointing", "--drop-vision",
     "--output", str(OUT / "hessian_scores.json"),
     "--validate-rows", rows[0],
 ]

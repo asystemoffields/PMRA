@@ -121,6 +121,10 @@ def capture_pass(model, targets: dict[str, torch.nn.Module], ids: torch.Tensor, 
         owns_site = site_owner[site_key] == key
 
         def hook(module, inputs, output):
+            # under gradient checkpointing the no-grad recording pass refires
+            # forward hooks; accumulate only in the grad-enabled recompute
+            if not torch.is_grad_enabled() or not output.requires_grad:
+                return
             if owns_site:
                 x = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).float()
                 if site_key not in cov:
@@ -172,7 +176,15 @@ def main() -> int:
     parser.add_argument("--capture-passes", type=int, default=1,
                         help="Split layers into N capture passes to bound covariance+grad RAM (4B+: use 4).")
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"],
-                        help="Model dtype; accumulators stay fp32 either way.")
+                        help="Model dtype; accumulators stay fp32 either way. NOTE: bf16 "
+                             "matmul falls back to a ~250x slower scalar path on CPUs "
+                             "without AVX512-BF16/AMX — fp32 + --gradient-checkpointing "
+                             "is the memory-bound fix.")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Recompute activations in backward; bounds the full-depth "
+                             "graph that otherwise swaps a 30 GB kernel at 4B fp32.")
+    parser.add_argument("--drop-vision", action="store_true",
+                        help="Replace an unused vision tower with Identity to free its params.")
     parser.add_argument("--output", type=Path, required=True, help="Where to write the tier1-compatible scores JSON.")
     parser.add_argument("--validate-rows", type=Path, default=None, help="Empirical allocation_rows.jsonl for the regret ladder.")
     parser.add_argument("--budget-bytes", type=int, default=None, help="Knapsack budget for regret validation.")
@@ -196,6 +208,15 @@ def main() -> int:
         from transformers import AutoModelForImageTextToText
         model = AutoModelForImageTextToText.from_pretrained(
             args.model_dir, torch_dtype=getattr(torch, args.dtype)).eval()
+    if args.drop_vision:
+        for holder in (model, getattr(model, "model", None)):
+            for attr in ("visual", "vision_tower", "vision_model"):
+                if holder is not None and isinstance(getattr(holder, attr, None), torch.nn.Module):
+                    setattr(holder, attr, torch.nn.Identity())
+                    print(f"[load] dropped vision tower at {type(holder).__name__}.{attr}", flush=True)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("[load] gradient checkpointing enabled", flush=True)
     all_targets = find_targets(model, families)
     if not all_targets:
         raise RuntimeError(f"no target linears matched families={sorted(families)}; "
@@ -250,9 +271,13 @@ def main() -> int:
         for module in targets.values():
             module.weight.grad = None
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({g: dict(s) for g, s in scores.items()}))
-    print(f"[score] wrote {args.output} ({len(scores)} groups; predicted dNLL vs fp16, sum over {n_tokens} tokens)", flush=True)
+        # incremental save: a session cap mid-run keeps the finished passes
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({g: dict(s) for g, s in scores.items()}))
+        (args.output.parent / (args.output.stem + "_detail.json")).write_text(json.dumps(detail))
+        print(f"[score] pass {i + 1}: wrote {args.output} ({len(scores)} groups so far)", flush=True)
+
+    print(f"[score] done ({len(scores)} groups; predicted dNLL vs fp16, sum over {n_tokens} tokens)", flush=True)
 
     if args.validate_rows:
         rows = [json.loads(l) for l in args.validate_rows.read_text().splitlines() if l.strip()]
