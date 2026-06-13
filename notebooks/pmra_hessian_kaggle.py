@@ -16,11 +16,16 @@ MODEL = {
     "highs": "q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_m",
 }
 FAMILIES = "mlp"        # empirical 4B probe set is all-MLP; DeltaNet layers have no self_attn.*
-CAPTURE_PASSES = 3      # cov RAM ~4.5 GB per 12-layer pass; checkpointing bounds the graph
+CAPTURE_PASSES = 8      # bounds simultaneous grads+cov; see v2 postmortem below
 DTYPE = "float32"       # bf16 matmul is ~250x slower on CPUs without AVX512-BF16/AMX
-CTX, CHUNKS = 512, 12   # rank validation tolerates sqrt(2) more SE; halves capture time
+CTX, CHUNKS = 512, 8    # rank validation tolerates sqrt(2) more SE; fewer chunks bounds wall-clock
 # v1 postmortem: fp32 with no checkpointing built a full-depth graph on pass 1
 # and swapped the 30 GB kernel to death (7.6h for one chunk).
+# v2 postmortem: 3 passes still OOM-killed (exit -9) on pass 1/3 (layers 0-10) ~40s
+# in. Peak = 16 GB fp32 model floor + grads for 33 in-range linears (~3.3 GB) +
+# down-proj cov (9728^2 x4 = 378 MB/layer x11 = 4.4 GB) + autograd overhead > 30 GB.
+# 8 passes (~4-5 layers each) drops the additive term to ~2 GB -> ~18 GB peak.
+# Cost: each pass re-runs the full fwd+bwd, so 8x12->8x8 chunks keeps it bounded.
 # ==================================================
 
 import glob, os, subprocess, sys

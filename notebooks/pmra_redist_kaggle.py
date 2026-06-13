@@ -125,8 +125,8 @@ tensors = {lab: {t.name: int(t.n_bytes) for t in r.tensors} for lab, r in reader
 def gbytes(group, label):
     return sum(tensors[label][n] for n in groups[group])
 
-attn_groups = sorted((g for g in groups if not g.endswith(":mlp")),
-                     key=lambda g: int(g.split(":")[0][1:]))
+attn_groups = sorted((g for g in groups if g.endswith(":attn")),
+                     key=lambda g: int(g.split(":")[0][1:]))  # L<n>:attn only; skip global:*
 print(f"{len(attn_groups)} non-mlp groups: {attn_groups[:4]} ... {attn_groups[-2:]}")
 n = len(attn_groups)
 bands = {"attn_early": attn_groups[: n // 3],

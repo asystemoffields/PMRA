@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(dir)",
+      "Bash(dir results\\\\run_008)",
+      "PowerShell(python -c \"from huggingface_hub import hf_hub_download; p = hf_hub_download\\('bartowski/nvidia_Nemotron-3-Nano-4B-GGUF', 'nvidia_Nemotron-3-Nano-4B-IQ2_M.gguf', cache_dir='C:/Users/power/Documents/PMRA/.cache'\\); print\\(p\\)\")",
+      "mcp__Claude_in_Chrome__list_connected_browsers",
+      "mcp__Claude_in_Chrome__switch_browser",
+      "mcp__Claude_in_Chrome__tabs_context_mcp"
+    ]
+  }
+}

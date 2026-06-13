@@ -48,7 +48,9 @@ image = (
     .run_commands(
         f"git clone --depth 1 {LLAMA_CPP_REPO} /opt/llama.cpp",
         "cd /opt/llama.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release "
-        "-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=90 && cmake --build build -j$(nproc)",
+        "-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=90 "
+        '-DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" && '
+        "cmake --build build --target llama-quantize llama-imatrix llama-perplexity llama-cli -j$(nproc)",
     )
     .add_local_file("fisher_gguf_recipe.py", "/root/fisher_gguf_recipe.py")
 )
