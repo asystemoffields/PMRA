@@ -216,7 +216,17 @@ def main() -> int:
                     print(f"[load] dropped vision tower at {type(holder).__name__}.{attr}", flush=True)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        print("[load] gradient checkpointing enabled", flush=True)
+        # HF's GradientCheckpointingLayer.__call__ gates on `self.gradient_checkpointing
+        # and self.training` (modeling_layers.py), so checkpointing is INERT in eval mode
+        # -> the full-depth graph builds and OOM-kills the kernel. Run in train mode but
+        # zero all dropout so the forward stays numerically identical to eval.
+        model.train()
+        for m in model.modules():
+            if hasattr(m, "attention_dropout"):
+                m.attention_dropout = 0.0
+            if isinstance(m, torch.nn.Dropout):
+                m.p = 0.0
+        print("[load] gradient checkpointing enabled (train mode; dropout zeroed)", flush=True)
     all_targets = find_targets(model, families)
     if not all_targets:
         raise RuntimeError(f"no target linears matched families={sorted(families)}; "
