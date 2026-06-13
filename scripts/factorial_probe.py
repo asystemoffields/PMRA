@@ -184,6 +184,12 @@ def main() -> int:
     parser.add_argument("--group-mode", default="layer_family")
     parser.add_argument("--budget-bytes", type=int, default=None)
     parser.add_argument("--shard", default=None, help="k/N stable-hash shard of design rows.")
+    parser.add_argument("--base-source", default=None,
+                        help="Splice/pair against this base instead of --low-source "
+                             "(e.g. the uniform target, for demote-to-fund-promote rows).")
+    parser.add_argument("--custom-design", type=Path, default=None,
+                        help="JSON design rows [{id, kind, assignment, predicted_dnll?}] "
+                             "to run instead of the generated PB design.")
     parser.add_argument("--make-design", action="store_true", help="Write design.json and exit.")
     parser.add_argument("--fit", action="store_true", help="Fit + report from finished evals and exit.")
     args = parser.parse_args()
@@ -193,21 +199,36 @@ def main() -> int:
     design_path = out / "design.json"
     evals_path = out / "factorial_evals.jsonl"
 
-    design = make_design(args.rows, args.budget_bytes)
-    design_path.write_text(json.dumps(design, indent=2))
-    print(f"[design] {len(design['factors'])} factors, {len(design['rows'])} rows "
-          f"-> {design_path}", flush=True)
+    if args.custom_design:
+        design = {"factors": [], "design_level": {},
+                  "rows": json.loads(args.custom_design.read_text())}
+        (out / "custom_design.json").write_text(json.dumps(design["rows"], indent=2))
+        print(f"[design] custom: {len(design['rows'])} rows from {args.custom_design}", flush=True)
+    else:
+        design = make_design(args.rows, args.budget_bytes)
+        design_path.write_text(json.dumps(design, indent=2))
+        print(f"[design] {len(design['factors'])} factors, {len(design['rows'])} rows "
+              f"-> {design_path}", flush=True)
     if args.make_design:
         return 0
     if args.fit:
-        fit_report(design, evals_path, args.rows)
+        if args.custom_design:
+            for line in evals_path.read_text().splitlines() if evals_path.exists() else []:
+                e = json.loads(line)
+                pred = e.get("predicted_dnll")
+                print(f"  {e['id']:16s} measured={e['measured_dnll']:+.5f}±{e['measured_se']:.5f}"
+                      f" net={e.get('net_bytes', 0)/1e6:+.1f}MB"
+                      + (f" predicted={pred:+.5f}" if pred is not None else ""))
+        else:
+            fit_report(design, evals_path, args.rows)
         return 0
 
     source_paths = parse_source_specs(args.source)
     readers = open_sources(source_paths)
     tensors_by_source = {label: {t.name: t for t in reader.tensors}
                          for label, reader in readers.items()}
-    base_reader = readers[args.low_source]
+    base_label = args.base_source or args.low_source
+    base_reader = readers[base_label]
     groups = build_groups(base_reader, args.group_mode)
 
     base_chunk_nlls = None
@@ -216,11 +237,11 @@ def main() -> int:
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row["label"] == f"{args.low_source}@calib" and "chunk_nlls" in row:
+            if row["label"] == f"{base_label}@calib" and "chunk_nlls" in row:
                 base_chunk_nlls = row["chunk_nlls"]
     if base_chunk_nlls is None:
-        print("[base] measuring low base (no cached chunk NLLs)", flush=True)
-        result = run_perplexity(args.llama_bin, source_paths[args.low_source],
+        print(f"[base] measuring {base_label} base (no cached chunk NLLs)", flush=True)
+        result = run_perplexity(args.llama_bin, source_paths[base_label],
                                 args.calib_text, args.ctx, args.chunks, args.threads)
         base_chunk_nlls = result["chunk_nlls"]
         with (out / "base_eval.json").open("w") as fh:
@@ -241,21 +262,25 @@ def main() -> int:
         for g, s in row["assignment"].items():
             for name in groups[g]:
                 tensor_sources[name] = s
+        net_bytes = sum(int(tensors_by_source[s][n].n_bytes) - int(tensors_by_source[base_label][n].n_bytes)
+                        for n, s in tensor_sources.items())
         assemble_mixed_gguf(mix_gguf, base_reader, tensors_by_source,
-                            tensor_sources, args.low_source)
+                            tensor_sources, base_label)
         result = run_perplexity(args.llama_bin, mix_gguf, args.calib_text,
                                 args.ctx, args.chunks, args.threads)
         mean, se = paired_delta(base_chunk_nlls, result["chunk_nlls"])
         record = {"id": row["id"], "kind": row["kind"],
+                  "base_source": base_label,
                   "n_promoted": len(row["assignment"]),
-                  "predicted_dnll": row["predicted_dnll"],
-                  "measured_dnll": mean, "measured_se": se,
+                  "predicted_dnll": row.get("predicted_dnll"),
+                  "measured_dnll": mean, "measured_se": se, "net_bytes": net_bytes,
                   "chunks": len(result["chunk_nlls"]), "tokens": result.get("tokens"),
                   "assignment": row["assignment"]}
         with evals_path.open("a") as fh:
             fh.write(json.dumps(record) + "\n")
         print(f"[run] {i}/{len(todo)} {row['id']}: measured={mean:+.5f}±{se:.5f} "
-              f"predicted={row['predicted_dnll']:+.5f} ({len(row['assignment'])} promotions)", flush=True)
+              + (f"predicted={row['predicted_dnll']:+.5f} " if row.get("predicted_dnll") is not None else "")
+              + f"({len(row['assignment'])} reassignments, net {net_bytes/1e6:+.1f}MB)", flush=True)
     if mix_gguf.exists():
         mix_gguf.unlink()
     print(f"[run] shard complete; evals in {evals_path}", flush=True)
