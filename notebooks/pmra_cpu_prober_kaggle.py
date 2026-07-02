@@ -23,8 +23,12 @@ MODELS = {
         "low": "iq2_m",
         "target": "iq3_xs",
         "highs": "q3_k_s,q3_k_m,q3_k_l,iq4_xs,q4_k_m",
-        "ref": "q8_0",          # near-lossless tier-1 reference; q8_0 keeps imatrix CPU time sane at 4B
-        "imatrix_url": None,
+        # no ref quant: bartowski ships the imatrix. The 06-13-style q8_0
+        # in-kernel imatrix + 7 HF-downloaded sources + artifact build blew the
+        # 12h cap on cov1 (CANCELLED, output discarded) — and if the dataset
+        # mount doesn't resolve, 7 quants + q8_0 don't fit 19.5GB disk either.
+        "ref": None,
+        "imatrix_url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-imatrix.gguf",
         "tensor_profile": "qwen35",
         "group_mode": "layer_family",
     },
@@ -54,6 +58,8 @@ CODE_CHUNKS = 48           # code evals get more chunks: only 3 of them, and the
 PROBE_SE_STOP = 0.004      # paired SEs below this are unresolvable at 24 chunks — don't chase them
 TIER2_TIME_BUDGET_MIN = 390  # stop probing at ~6.5h so finalize + artifact always fit the 12h cap
 MERGE_INPUT_CHECKPOINTS = False  # True ONLY for a deliberate shard/resume kernel with pinned sources
+BUILD_ARTIFACT = True      # False for verdict-only arms: the artifact cell (~1h torch install+build)
+                           # can push a near-cap kernel past 12h, and a CANCELLED kernel publishes NOTHING
 LLAMA_RELEASE = "b9859"    # pinned: verdicts must not depend on whichever llama.cpp shipped today
 # ==================================================
 
@@ -224,7 +230,7 @@ assert result.returncode == 0, "cpu_prober failed — do not let the kernel repo
 
 # %%
 # Build the artifact when finalizing (needs torch for the gate-spec import)
-if STAGES in {"all", "finalize"} and (OUT / "result.json").exists():
+if BUILD_ARTIFACT and STAGES in {"all", "finalize"} and (OUT / "result.json").exists():
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "torch", "--index-url",
                     "https://download.pytorch.org/whl/cpu"], check=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "transformers", "safetensors"], check=True)

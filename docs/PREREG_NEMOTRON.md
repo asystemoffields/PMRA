@@ -123,3 +123,13 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   CHUNKS=96, checkpoints carried from run1 (same pinned llama.cpp b9859, same corpora — cache
   signatures enforce this; code evals at 48 chunks carry over as valid cache). Selection is
   UNCHANGED — only the verdict evals re-run at higher resolution.
+- **2026-07-02 cov1 (`pmra-q354b-cov1`) DIED AT THE 12h CAP (~20:10 UTC), output discarded — no
+  rows banked.** Post-mortem: the mounted GGUF dataset didn't resolve (workspace snapshot shows HF
+  .cache downloads), so it paid full downloads; plus the 06-13-style overhead (in-kernel q8_0
+  imatrix, 7 sources, artifact build) on top of tier-2. **cov2 amendments (within-run scoring
+  makes these sound; they also align the arm's tier-1 conditions with the Nemotron arm):** drop
+  q8_0, ref = target (iq3_xs); imatrix = bartowski's precomputed (verified to exist, 3.6MB);
+  MAX_PROBES 24; tier-2 time budget 240 min; BUILD_ARTIFACT=False (verdict-only — the artifact is
+  rebuildable from result.json + checkpoints if the arm passes). The original "same conditions as
+  06-13" framing is void (it died with the kernel); the arm's question is unchanged: does full
+  DeltaNet coverage beat stock IQ3_XS within-run where 76.6%-coverage GRAYed.
