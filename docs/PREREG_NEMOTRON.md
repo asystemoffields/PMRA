@@ -109,3 +109,17 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
 - Two consecutive kernel failures on the same arm → stop launching, reproduce the failing stage
   locally at 135M, only then re-push.
 - Disk budget pre-checked: 5 quants ≈ 12.3GB + probe/mix ≈ 2.5GB + bins ≪ 19.5GB.
+
+## Run log
+
+- **2026-07-02 run1 (`pmra-nem4b-run1`, ~8h):** prober verdict **GO** — mix 2.49649 vs stock iq3_xs
+  2.50262 (mix payload 2434.6MB, 14.5MB under stock), random median-of-3 2.49989, code guardrail
+  pass (+0.00537±0.00154 at 48 chunks vs ε=0.02). **Amendment-3 banking bar NOT met:** target-leg
+  paired Δ +0.00613±0.00378 = 1.62σ < 2σ ⇒ treated as GRAY, parked, not shipped.
+- **Diagnostic re-run (licensed by the GRAY rule, hypothesis written pre-launch):** the target-leg
+  delta is real but under-resolved at 24 eval chunks. Prediction: at 96 eval chunks (4× tokens,
+  SE ≈ 0.0019) the paired Δ remains ≥ +0.004 and reaches ≥ 2σ. Falsification: Δ shrinks toward 0
+  ⇒ the GO was eval noise; bank GRAY and stop. Design: `pmra-nem4b-run2`, STAGES=finalize,
+  CHUNKS=96, checkpoints carried from run1 (same pinned llama.cpp b9859, same corpora — cache
+  signatures enforce this; code evals at 48 chunks carry over as valid cache). Selection is
+  UNCHANGED — only the verdict evals re-run at higher resolution.
