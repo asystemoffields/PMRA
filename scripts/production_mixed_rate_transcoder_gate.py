@@ -3178,7 +3178,9 @@ def main() -> int:
     parser.add_argument("--domain-agg", choices=["weighted_sum", "worst_case"], default="weighted_sum",
                         help="How to aggregate per-domain improvements into the selection score.")
     parser.add_argument("--code-no-regress", type=float, default=0.0,
-                        help="Release guardrail epsilon: code-domain NLL/KL must not exceed stock by more than this. 0=off.")
+                        help="Release guardrail epsilon: code-domain NLL/KL must not exceed stock by more than this. 0=off. "
+                             "ENFORCED on the llama.cpp ship path (scripts/cpu_prober.py --code-text); the torch path "
+                             "records the flag but does not enforce it — use scripts/evaluate_pmra_code_likelihood.py for a torch-side A/B.")
     parser.add_argument("--triage", action="store_true",
                         help="Enable probing-cost triage (empirically probe only top-fraction + knapsack boundary).")
     parser.add_argument("--triage-pre-rank", choices=["weight_sse", "fisher"], default="weight_sse",
@@ -3194,6 +3196,9 @@ def main() -> int:
     parser.add_argument("--ab-decide-on", choices=["heldout_nll", "heldout_kl", "eval_nll"], default="heldout_nll",
                         help="Metric that picks the A/B winner.")
     args = parser.parse_args()
+    if args.code_no_regress:
+        print("[warn] --code-no-regress is enforced on the llama.cpp ship path (scripts/cpu_prober.py --code-text); "
+              "this torch path records the flag but does not enforce it.", flush=True)
     args.layers = parse_layers(args.layers)
     high_sources = parse_csv(args.high_sources)
     sweep_payload_bpws = parse_float_csv(args.sweep_payload_bpws)

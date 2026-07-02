@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,10 +45,12 @@ from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter
 from gguf import quants as gguf_quants
 
 # ---------------------------------------------------------------------------
-# Group mapping (llama-family). Group names MUST match build_tensor_specs()
-# in production_mixed_rate_transcoder_gate.py for the given profile, because
+# Group mapping. Group names MUST match build_tensor_specs() in
+# production_mixed_rate_transcoder_gate.py for the given profile, because
 # build_mixed_gguf_artifact.py rebuilds the tensor->group mapping from gate
-# specs when materializing the artifact.
+# specs when materializing the artifact. Hybrid profiles (qwen35, nemotron_h)
+# carry non-llama tails (ssm_*, attn_qkv, ...) that the default mapping would
+# silently exclude from the promotion space.
 # ---------------------------------------------------------------------------
 
 GLOBAL_GROUPS = {
@@ -57,30 +60,106 @@ GLOBAL_GROUPS = {
 }
 ATTN_TAILS = {"attn_q", "attn_k", "attn_v", "attn_output", "attn_norm", "attn_q_norm", "attn_k_norm"}
 MLP_TAILS = {"ffn_gate", "ffn_up", "ffn_down", "ffn_norm"}
-_BLK_RE = re.compile(r"^blk\.(\d+)\.(\w+)\.(weight|bias)$")
+_BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
+
+# Qwen3.5 DeltaNet hybrid: full-tail -> (layer_family, tensor-mode short).
+QWEN35_TAILS = {
+    "attn_q.weight": ("attn", "attn_q"),
+    "attn_k.weight": ("attn", "attn_k"),
+    "attn_v.weight": ("attn", "attn_v"),
+    "attn_output.weight": ("attn", "attn_output"),
+    "attn_qkv.weight": ("attn", "attn_qkv"),
+    "attn_gate.weight": ("attn", "attn_gate"),
+    "ssm_a": ("attn", "ssm_a"),
+    "ssm_conv1d.weight": ("attn", "ssm_conv1d"),
+    "ssm_dt.bias": ("attn", "ssm_dt"),
+    "ssm_norm.weight": ("attn", "ssm_norm"),
+    "ssm_out.weight": ("attn", "ssm_out"),
+    "ssm_alpha.weight": ("attn", "ssm_alpha"),
+    "ssm_beta.weight": ("attn", "ssm_beta"),
+    "ffn_gate.weight": ("mlp", "ffn_gate"),
+    "ffn_up.weight": ("mlp", "ffn_up"),
+    "ffn_down.weight": ("mlp", "ffn_down"),
+    "attn_norm.weight": ("attn", "attn_norm"),
+    "post_attention_norm.weight": ("mlp", "post_attention_norm"),
+    "attn_q_norm.weight": ("attn", "attn_q_norm"),
+    "attn_k_norm.weight": ("attn", "attn_k_norm"),
+}
+
+# NemotronH hybrid: M=Mamba2, -=MLP-only, *=Attention-only, per layer index.
+NEMOTRON_H_PATTERN = "M-M-M-MM-M-M*-M-M*-M-M-M*-M-M-MM*-MMM-M-M-"
+NEMOTRON_H_FAMILY = {"M": "ssm", "-": "mlp", "*": "attn"}
+NEMOTRON_H_TAILS = {
+    "M": {
+        "attn_norm.weight": "attn_norm",
+        "ssm_in.weight": "ssm_in",
+        "ssm_conv1d.weight": "ssm_conv1d",
+        "ssm_conv1d.bias": "ssm_conv1d_bias",
+        "ssm_dt.bias": "ssm_dt_bias",
+        "ssm_a": "ssm_a",
+        "ssm_d": "ssm_d",
+        "ssm_norm.weight": "ssm_norm",
+        "ssm_out.weight": "ssm_out",
+    },
+    "-": {
+        "attn_norm.weight": "attn_norm",
+        "ffn_up.weight": "ffn_up",
+        "ffn_down.weight": "ffn_down",
+    },
+    "*": {
+        "attn_norm.weight": "attn_norm",
+        "attn_q.weight": "attn_q",
+        "attn_k.weight": "attn_k",
+        "attn_v.weight": "attn_v",
+        "attn_output.weight": "attn_output",
+    },
+}
 
 
-def group_for_tensor(name: str, group_mode: str) -> str | None:
+def group_for_tensor(name: str, group_mode: str, tensor_profile: str = "qwen") -> str | None:
     if name in GLOBAL_GROUPS:
         return GLOBAL_GROUPS[name]
     match = _BLK_RE.match(name)
     if not match:
         return None  # rope_freqs etc: stays at base source, never promoted
     layer, tail = int(match.group(1)), match.group(2)
-    if tail not in ATTN_TAILS | MLP_TAILS:
+    if group_mode not in ("tensor", "layer_family"):
+        raise ValueError(f"unknown group mode {group_mode!r}")
+
+    if tensor_profile == "nemotron_h":
+        if layer >= len(NEMOTRON_H_PATTERN):
+            raise ValueError(f"layer {layer} outside NEMOTRON_H_PATTERN ({len(NEMOTRON_H_PATTERN)} layers); "
+                             "wrong model for this profile?")
+        layer_type = NEMOTRON_H_PATTERN[layer]
+        short = NEMOTRON_H_TAILS[layer_type].get(tail)
+        if short is None:
+            return None
+        if group_mode == "tensor":
+            return f"L{layer}:{short}"
+        return f"L{layer}:{NEMOTRON_H_FAMILY[layer_type]}"
+
+    if tensor_profile == "qwen35":
+        entry = QWEN35_TAILS.get(tail)
+        if entry is None:
+            return None
+        family, short = entry
+        return f"L{layer}:{short}" if group_mode == "tensor" else f"L{layer}:{family}"
+
+    # Default llama-family profiles (qwen/granite/olmo/...): weights and biases
+    # of a tensor share one group, norms ride with their family.
+    stem, _, kind = tail.partition(".")
+    if kind not in ("weight", "bias") or stem not in ATTN_TAILS | MLP_TAILS:
         return None
     if group_mode == "tensor":
-        return f"L{layer}:{tail}"
-    if group_mode == "layer_family":
-        family = "attn" if tail in ATTN_TAILS else "mlp"
-        return f"L{layer}:{family}"
-    raise ValueError(f"unknown group mode {group_mode!r}")
+        return f"L{layer}:{stem}"
+    family = "attn" if stem in ATTN_TAILS else "mlp"
+    return f"L{layer}:{family}"
 
 
-def build_groups(reader: GGUFReader, group_mode: str) -> dict[str, list[str]]:
+def build_groups(reader: GGUFReader, group_mode: str, tensor_profile: str = "qwen") -> dict[str, list[str]]:
     groups: dict[str, list[str]] = defaultdict(list)
     for tensor in reader.tensors:
-        group = group_for_tensor(tensor.name, group_mode)
+        group = group_for_tensor(tensor.name, group_mode, tensor_profile)
         if group is not None:
             groups[group].append(tensor.name)
     return dict(groups)
@@ -225,6 +304,17 @@ def chunk_nlls_from_cumulative(cum: list[float]) -> list[float]:
         out.append(total - prev_total)
         prev_total = total
     return out
+
+
+def paired_chunk_stats(base_chunk_nlls: list[float], probe_chunk_nlls: list[float]) -> tuple[float, float]:
+    """(mean, se) of the paired per-chunk NLL delta base - probe (positive = probe better)."""
+    k = min(len(base_chunk_nlls), len(probe_chunk_nlls))
+    deltas = [b - p for b, p in zip(base_chunk_nlls[:k], probe_chunk_nlls[:k])]
+    mean = sum(deltas) / k
+    if k < 2:
+        return mean, float("inf")
+    var = sum((d - mean) ** 2 for d in deltas) / (k - 1)
+    return mean, (var / k) ** 0.5
 
 
 def paired_probe_stats(base_chunk_nlls: list[float], cum_ppls: list[float]) -> tuple[float, float]:
@@ -564,6 +654,51 @@ def append_row(path: Path, row: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def apply_code_guardrail(
+    verdict: str,
+    code_nlls: dict[str, float | None],
+    candidate: str,
+    target: str,
+    epsilon: float,
+    code_chunk_nlls: dict[str, list[float] | None] | None = None,
+) -> tuple[str, dict]:
+    """Release guardrail: the candidate mix's code-corpus NLL must not exceed
+    the stock target quant's by more than epsilon nats. epsilon<=0 records the
+    code NLLs without enforcing. A failing guardrail downgrades GO to GRAY —
+    the mix still beats target/random on the general corpus, but is not
+    ship-clean per-domain."""
+    block: dict = {
+        "enforced": epsilon > 0,
+        "epsilon": epsilon,
+        "candidate": candidate,
+        "target": target,
+        "code_nll": {k: v for k, v in code_nlls.items() if v is not None},
+    }
+    cand_nll = code_nlls.get(candidate)
+    stock_nll = code_nlls.get(target)
+    if cand_nll is None or stock_nll is None:
+        block["pass"] = None
+        return verdict, block
+    regression = cand_nll - stock_nll
+    block["regression_vs_target"] = regression
+    if code_chunk_nlls:
+        cand_chunks = code_chunk_nlls.get(candidate)
+        stock_chunks = code_chunk_nlls.get(target)
+        if cand_chunks and stock_chunks:
+            k = min(len(cand_chunks), len(stock_chunks))
+            deltas = [c - s for c, s in zip(cand_chunks[:k], stock_chunks[:k])]
+            mean = sum(deltas) / k
+            if k >= 2:
+                var = sum((d - mean) ** 2 for d in deltas) / (k - 1)
+                block["regression_se"] = (var / k) ** 0.5
+                block["regression_chunks"] = k
+    block["pass"] = (regression <= epsilon) if epsilon > 0 else None
+    if block["pass"] is False and verdict == "GO":
+        block["verdict_before_guardrail"] = verdict
+        verdict = "GRAY"
+    return verdict, block
+
+
 def parse_source_specs(items: list[str]) -> dict[str, Path]:
     sources = {}
     for item in items:
@@ -583,11 +718,24 @@ def main() -> int:
     parser.add_argument("--ref-source", default=None, help="Near-lossless reference for tier-1 proxy (default: f16 if present, else target).")
     parser.add_argument("--calib-text", type=Path, required=True)
     parser.add_argument("--eval-text", type=Path, default=None, help="Held-out text for final variant NLLs (default: calib text).")
+    parser.add_argument("--code-text", type=Path, default=None,
+                        help="Code corpus for the release guardrail: measures code-domain NLL of low/target/mix variants at finalize.")
+    parser.add_argument("--code-no-regress", type=float, default=0.0,
+                        help="Release guardrail epsilon (nats): the mix's code NLL must not exceed the stock target's "
+                             "by more than this. Requires --code-text. 0=record code NLLs without enforcing.")
+    parser.add_argument("--code-chunks", type=int, default=0,
+                        help="Chunks for code-corpus evals (0=same as --chunks). More chunks tighten the guardrail SE.")
+    parser.add_argument("--tier2-time-budget-min", type=float, default=0.0,
+                        help="Stop launching tier-2 probes once the projected total exceeds this many minutes "
+                             "(completed rows are kept; unprobed candidates fall to proxy backfill). 0=off.")
     parser.add_argument("--imatrix", type=Path, default=None, help="Existing imatrix GGUF (skips llama-imatrix run).")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--llama-bin", type=Path, required=True, help="Directory with llama-perplexity / llama-imatrix.")
     parser.add_argument("--group-mode", default="layer_family", choices=["layer_family", "tensor"])
-    parser.add_argument("--tensor-profile", default="qwen", help="Recorded for build_mixed_gguf_artifact.py group reconstruction.")
+    parser.add_argument("--tensor-profile", default="qwen",
+                        help="Selects the tensor->group mapping (must match the gate profile; hybrid profiles "
+                             "qwen35/nemotron_h map ssm_*/attn_qkv tails) and is recorded for "
+                             "build_mixed_gguf_artifact.py group reconstruction.")
     parser.add_argument("--ctx", type=int, default=512)
     parser.add_argument("--chunks", type=int, default=24)
     parser.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 4) - 2))
@@ -614,6 +762,8 @@ def main() -> int:
                         help="Leave budget unspent when empirical improvements run out, instead of "
                              "filling the remainder by proxy rank (probed-negative candidates stay excluded).")
     args = parser.parse_args()
+    if args.code_no_regress > 0 and args.code_text is None:
+        parser.error("--code-no-regress requires --code-text")
 
     high_sources = [s.strip() for s in args.high_sources.split(",") if s.strip()]
     source_paths = parse_source_specs(args.source)
@@ -633,7 +783,7 @@ def main() -> int:
     readers = open_sources(source_paths)
     tensors_by_source = {label: tensor_map(reader) for label, reader in readers.items()}
     base_reader = readers[args.low_source]
-    groups = build_groups(base_reader, args.group_mode)
+    groups = build_groups(base_reader, args.group_mode, args.tensor_profile)
     grouped_names = {name for names in groups.values() for name in names}
     total_weights = sum(int(t.n_elements) for t in base_reader.tensors if t.name in grouped_names)
     n_layers = parse_block_count(base_reader)
@@ -648,20 +798,45 @@ def main() -> int:
         raise ValueError(f"target {args.target_source} is not larger than low {args.low_source}; no promotion budget")
     print(f"[cpu-prober] budget_extra={budget_extra/1e6:.2f} MB", flush=True)
 
+    # ---- Cache signature ---------------------------------------------------
+    # Checkpoint rows are only trusted when they were measured under the same
+    # conditions: model, ctx, llama.cpp build, and the exact corpus bytes.
+    # Anything else (a stale kernel attachment, a different llama.cpp release,
+    # a changed corpus) silently mixing into the verdict is the condition-
+    # mismatch failure mode this guards against.
+    ver_proc = subprocess.run([str(args.llama_bin / "llama-perplexity"), "--version"],
+                              capture_output=True, text=True)
+    llama_build = ((ver_proc.stderr + ver_proc.stdout).strip().splitlines() or ["unknown"])[0]
+    base_sig = f"{source_paths[args.target_source].name}|ctx{args.ctx}|{llama_build}"
+    print(f"[cpu-prober] cache signature: {base_sig}", flush=True)
+
+    _text_sha_cache: dict[str, str] = {}
+
+    def text_sha(path: Path) -> str:
+        key = str(path)
+        if key not in _text_sha_cache:
+            _text_sha_cache[key] = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        return _text_sha_cache[key]
+
     # ---- Tier 0: baselines ------------------------------------------------
     scalar_path = ckpt_dir / "scalar_evals.jsonl"
     scalar_cache = {row["label"]: row for row in (json.loads(l) for l in scalar_path.read_text().splitlines())} if scalar_path.exists() else {}
 
-    def eval_gguf(label: str, gguf: Path, text: Path, tag: str, require_chunks: bool = False) -> dict:
+    def eval_gguf(label: str, gguf: Path, text: Path, tag: str, require_chunks: bool = False,
+                  chunks: int = 0) -> dict:
+        chunks = chunks or args.chunks
         key = f"{label}@{tag}"
         cached = scalar_cache.get(key)
-        if cached is not None and not (require_chunks and "chunk_nlls" not in cached):
-            return cached
         if cached is not None:
-            print(f"[tier0] cached {key} lacks per-chunk NLLs (older build); re-measuring", flush=True)
+            stale = (cached.get("sig") != base_sig or cached.get("text_sha") != text_sha(text)
+                     or cached.get("chunks") != chunks)
+            if not stale and not (require_chunks and "chunk_nlls" not in cached):
+                return cached
+            reason = "stale conditions" if stale else "lacks per-chunk NLLs"
+            print(f"[tier0] cached {key} {reason}; re-measuring", flush=True)
         print(f"[tier0] llama-perplexity {label} on {text.name}", flush=True)
-        result = run_perplexity(args.llama_bin, gguf, text, args.ctx, args.chunks, args.threads)
-        row = {"label": key, **result}
+        result = run_perplexity(args.llama_bin, gguf, text, args.ctx, chunks, args.threads)
+        row = {"label": key, "sig": base_sig, "text_sha": text_sha(text), "chunks": chunks, **result}
         scalar_cache[key] = row
         append_row(scalar_path, row)
         return row
@@ -702,6 +877,11 @@ def main() -> int:
     # ---- Tier 2: empirical probes ------------------------------------------
     rows_path = ckpt_dir / "allocation_rows.jsonl"
     done = load_rows(rows_path)
+    stale_keys = {k for k, r in done.items()
+                  if r.get("sig") != base_sig or r.get("text_sha") != text_sha(args.calib_text)}
+    if stale_keys:
+        print(f"[tier2] discarding {len(stale_keys)} checkpoint rows measured under different conditions", flush=True)
+        done = {k: r for k, r in done.items() if k not in stale_keys}
     probe_set = choose_probe_set(candidates, proxy_selection, budget_extra,
                                  args.probe_fraction, args.boundary_band, args.max_probes)
     shard_idx = shard_count = None
@@ -715,7 +895,16 @@ def main() -> int:
         print(f"[tier2] probing {len(todo)} of {len(probe_set)} candidates"
               + (f" (shard {shard_idx}/{shard_count})" if shard_count else ""), flush=True)
         probe_gguf = work_dir / "probe.gguf"
+        tier2_start = time.monotonic()
         for idx, cand in enumerate(todo, start=1):
+            if args.tier2_time_budget_min > 0 and idx > 1:
+                elapsed_min = (time.monotonic() - tier2_start) / 60
+                per_probe = elapsed_min / (idx - 1)
+                if elapsed_min + per_probe > args.tier2_time_budget_min:
+                    print(f"[tier2] time budget: {elapsed_min:.0f} min after {idx - 1} probes "
+                          f"(~{per_probe:.1f} min/probe); skipping remaining {len(todo) - idx + 1} "
+                          f"(they fall to proxy backfill)", flush=True)
+                    break
             assemble_mixed_gguf(
                 probe_gguf, base_reader, tensors_by_source,
                 {name: cand["source"] for name in groups[cand["group"]]},
@@ -738,6 +927,8 @@ def main() -> int:
                 probe_meta = {"probe_chunks": args.chunks, "probe_early_stopped": False}
             row = {
                 **{k: cand[k] for k in ["group", "source", "low_bytes", "high_bytes", "extra_bytes"]},
+                "sig": base_sig,
+                "text_sha": text_sha(args.calib_text),
                 "saved_bytes": 0,
                 "base_source": None,
                 "calib_nll": nll_low - improvement,
@@ -804,8 +995,13 @@ def main() -> int:
             backfilled += 1
         print(f"[final] backfill: +{backfilled} proxy-ranked promotions -> {used/1e6:.2f}/{budget_extra/1e6:.2f} MB", flush=True)
 
-    rng = random.Random(args.seed)
-    random_selection = select_random(candidates, budget_extra, rng)
+    # Allocation control: 3 seeded random draws; the verdict leg reads the
+    # median so one lucky/unlucky draw can't flip GO/GRAY on its own.
+    random_selections = {
+        "c2_random_same_budget": select_random(candidates, budget_extra, random.Random(args.seed)),
+        "c2_random_same_budget_b": select_random(candidates, budget_extra, random.Random(args.seed + 1)),
+        "c2_random_same_budget_c": select_random(candidates, budget_extra, random.Random(args.seed + 2)),
+    }
 
     def selection_sources(selection: list[dict]) -> dict[str, str]:
         mapping = {}
@@ -815,15 +1011,25 @@ def main() -> int:
         return mapping
 
     variants: dict[str, dict] = {}
+    eval_chunks_by_variant: dict[str, list[float] | None] = {}
+    code_chunks_by_variant: dict[str, list[float] | None] = {}
     for label in sorted({args.low_source, args.target_source, ref, *high_sources}):
         entry = eval_gguf(label, source_paths[label], eval_text, "eval")
+        eval_chunks_by_variant[label] = entry.get("chunk_nlls")
         variants[label] = {
             "nll": entry["nll"], "ppl": entry["ppl"], "tokens": entry["tokens"],
             "payload_bytes": payload_bytes(label),
             "payload_bpw": payload_bytes(label) * 8 / total_weights,
         }
+    if args.code_text:
+        for label in sorted({args.low_source, args.target_source}):
+            code_row = eval_gguf(label, source_paths[label], args.code_text, "code",
+                                 chunks=args.code_chunks)
+            code_chunks_by_variant[label] = code_row.get("chunk_nlls")
+            variants[label]["code_nll"] = code_row["nll"]
+            variants[label]["code_ppl"] = code_row["ppl"]
 
-    mixes = {args.variant_name: final_selection, "c2_random_same_budget": random_selection}
+    mixes = {args.variant_name: final_selection, **random_selections}
     for name, selection in mixes.items():
         mix_path = work_dir / f"{name}.gguf"
         mix_payload = assemble_mixed_gguf(mix_path, base_reader, tensors_by_source,
@@ -834,18 +1040,28 @@ def main() -> int:
             for t in base_reader.tensors if t.name in grouped_names
         )
         result = run_perplexity(args.llama_bin, mix_path, eval_text, args.ctx, args.chunks, args.threads)
+        eval_chunks_by_variant[name] = result.get("chunk_nlls")
         variants[name] = {
             "nll": result["nll"], "ppl": result["ppl"], "tokens": result["tokens"],
             "payload_bytes": mix_grouped,
             "payload_bpw": mix_grouped * 8 / total_weights,
             "file_bytes": mix_path.stat().st_size,
         }
+        if args.code_text and name == args.variant_name:
+            code_result = run_perplexity(args.llama_bin, mix_path, args.code_text, args.ctx,
+                                         args.code_chunks or args.chunks, args.threads)
+            code_chunks_by_variant[name] = code_result.get("chunk_nlls")
+            variants[name]["code_nll"] = code_result["nll"]
+            variants[name]["code_ppl"] = code_result["ppl"]
         mix_path.unlink()
-        print(f"[final] {name}: NLL={result['nll']:.5f} payload={mix_grouped/1e6:.1f} MB", flush=True)
+        print(f"[final] {name}: NLL={result['nll']:.5f}"
+              + (f" codeNLL={variants[name]['code_nll']:.5f}" if "code_nll" in variants[name] else "")
+              + f" payload={mix_grouped/1e6:.1f} MB", flush=True)
 
     candidate_nll = variants[args.variant_name]["nll"]
     target_nll = variants[args.target_source]["nll"]
-    random_nll = variants["c2_random_same_budget"]["nll"]
+    random_by_nll = sorted(((variants[name]["nll"], name) for name in random_selections))
+    random_nll, random_median_name = random_by_nll[len(random_by_nll) // 2]
     beats_target = candidate_nll < target_nll
     beats_random = candidate_nll <= random_nll
     if beats_target and beats_random:
@@ -855,13 +1071,43 @@ def main() -> int:
     else:
         verdict = "NO-GO"
 
+    # Paired per-chunk deltas for the two verdict legs (positive = mix better);
+    # point estimates alone can't distinguish a real edge from 12k-token noise.
+    verdict_stats = {}
+    cand_chunks = eval_chunks_by_variant.get(args.variant_name)
+    for leg, other in [("vs_target", args.target_source), ("vs_random_median", random_median_name)]:
+        other_chunks = eval_chunks_by_variant.get(other)
+        if cand_chunks and other_chunks:
+            mean, se = paired_chunk_stats(other_chunks, cand_chunks)
+            verdict_stats[leg] = {"delta": mean, "se": se}
+
+    decision_bits = [f"cpu prober mix NLL {candidate_nll:.5f} vs target {target_nll:.5f} "
+                     f"(random control median-of-3 {random_nll:.5f})"]
+    if "vs_target" in verdict_stats:
+        vt = verdict_stats["vs_target"]
+        decision_bits.append(f"target leg paired dNLL {vt['delta']:+.5f}±{vt['se']:.5f}")
+    code_guardrail = None
+    if args.code_text:
+        code_nlls = {label: entry.get("code_nll") for label, entry in variants.items()}
+        verdict, code_guardrail = apply_code_guardrail(
+            verdict, code_nlls, args.variant_name, args.target_source, args.code_no_regress,
+            code_chunk_nlls=code_chunks_by_variant)
+        if code_guardrail.get("regression_vs_target") is not None:
+            state = {True: "pass", False: "FAIL", None: "recorded"}[code_guardrail["pass"]]
+            se_bit = (f"±{code_guardrail['regression_se']:.5f}"
+                      if "regression_se" in code_guardrail else "")
+            decision_bits.append(
+                f"code guardrail {state}: regression {code_guardrail['regression_vs_target']:+.5f}{se_bit} "
+                f"(eps {args.code_no_regress:g})")
+
     all_rows = empirical + proxy_zeroed
     result_doc = {
         "created_utc": datetime.now(UTC).isoformat(),
         "prober": "cpu_llama_cpp",
         "verdict": verdict,
         "status": verdict,
-        "decision_text": f"{verdict}: cpu prober mix NLL {candidate_nll:.5f} vs target {target_nll:.5f} (random control {random_nll:.5f})",
+        "decision_text": f"{verdict}: " + "; ".join(decision_bits),
+        "code_guardrail": code_guardrail,
         "args": {
             "low_source": args.low_source,
             "target_source": args.target_source,
@@ -873,6 +1119,11 @@ def main() -> int:
             "candidate_variant": args.variant_name,
             "calib_text": str(args.calib_text),
             "eval_text": str(eval_text),
+            "code_text": str(args.code_text) if args.code_text else None,
+            "code_no_regress": args.code_no_regress,
+            "code_chunks": args.code_chunks or args.chunks,
+            "tier2_time_budget_min": args.tier2_time_budget_min,
+            "cache_sig": base_sig,
             "ctx": args.ctx, "chunks": args.chunks,
             "probe_fraction": args.probe_fraction,
             "boundary_band": args.boundary_band,
@@ -882,11 +1133,12 @@ def main() -> int:
         },
         "total_weight_count": int(total_weights),
         "budget_extra_bytes": int(budget_extra),
-        "selection_base_sources": {args.variant_name: args.low_source, "c2_random_same_budget": args.low_source},
-        "selections": {
-            args.variant_name: final_selection,
-            "c2_random_same_budget": random_selection,
-        },
+        "verdict_stats": verdict_stats,
+        "random_control_median": random_median_name,
+        "backfill_count": sum(1 for row in final_selection if row.get("backfill_proxy")),
+        "backfill_extra_bytes": sum(row["extra_bytes"] for row in final_selection if row.get("backfill_proxy")),
+        "selection_base_sources": {name: args.low_source for name in mixes},
+        "selections": {name: selection for name, selection in mixes.items()},
         "allocation_rows": all_rows,
         "tier2_probe_count": len(done),
         "tier1_candidate_count": len(candidates),

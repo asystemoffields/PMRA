@@ -1,4 +1,43 @@
-# PMRA v2 — status (as of 2026-06-10)
+# PMRA v2 — status (as of 2026-07-02)
+
+## Update 2026-07-02 (autonomous run)
+
+- **Merge to main: already done.** `pmra-objective-upgrade` is an ancestor of `main`; main carries
+  everything plus the Jun-12/13 Hessian/factorial/redist work. The "merge to main" item below is stale.
+- **Redist kernel collected** (sat COMPLETE on Kaggle since 06-13) → `results-live/redist/` in the
+  qwen35 run area. Sign convention: dnll = base − probe, positive = better (matches RECOVERY.md).
+  Base iq3_xs NLL 2.579. Verdicts:
+  - conservative redistribution is ≈free byte savings: `demote_only` (L8/L16 mlp→iq2_m)
+    +0.0030±0.0037 at −11.1MB; `redist_cons` +0.0042±0.0035 at −2.8MB;
+  - aggressive redistribution weakly hurts: `redist_aggr` −0.0050±0.0042 at −2.8MB;
+  - attn-band→q3_k_s from iq2_m base: early helps (+0.0057±0.0027), mid/late hurt
+    (−0.0092±0.0030, −0.0094±0.0013) with mid at negative net bytes — stock iq2_m likely already
+    bumps those attn tensors higher, so the "promotion" was a demotion there;
+  - `attn_plus_knap` +0.0818±0.0087 for +224MB — the MLP-promotion knapsack carries the real ΔNLL.
+- **Coverage-gap finding (major): the qwen35 CPU-prober GRAY verdict ran with 23.4% of payload
+  bytes excluded from the promotion space.** `cpu_prober.group_for_tensor` only knew llama-family
+  tails; all 253 DeltaNet tensors (attn_qkv, attn_gate, ssm_*, post_attention_norm) fell out —
+  verified against the real bartowski IQ2_M header (old mapping 76.6% of bytes; new `qwen35`
+  profile 99.3%, only the 4 nextn.* MTP tensors stay at base, matching the gate spec). The GRAY
+  (mix 2.287 vs target 2.254) had the mix locked to IQ2_M on ~1/4 of the model — a full-coverage
+  re-run is a live candidate to clear it.
+- **Prober is now profile-aware:** `--tensor-profile qwen35|nemotron_h` maps hybrid tails
+  (mirrors `build_tensor_specs`; `tests/test_grouping.py`). nemotron_h verified 100% coverage
+  (263/263 tensors) against the real bartowski Nemotron-3-Nano-4B IQ2_M header via
+  `tools/check_gguf_grouping.py` (new).
+- **A/B code guardrail: DONE on the ship path.** `cpu_prober.py --code-text CODE.TXT
+  --code-no-regress EPS`: measures code-domain NLL of low/target/mix at finalize, emits a
+  `code_guardrail` block in result.json, downgrades GO→GRAY when the mix's code NLL exceeds the
+  stock target's by >EPS. Corpus = MBPP-sanitized + HumanEval via `tools/build_code_corpus.py`
+  (421 tasks, deterministic, ungated — same benchmarks as evaluate_pmra_code_likelihood.py).
+  Tests: `tests/test_code_guardrail.py`. The torch-path flag stays record-only (warns loudly).
+- **Anneal/local-refinement objective wiring: explicitly deferred.** Torch-path search nicety;
+  the ship path never calls it; not worth the risk without a GPU bench this run.
+- **Remaining to ship:** Nemotron-3-Nano-4B CPU-prober validation on Kaggle (single kernel,
+  HF-download fallback — the Kaggle GGUF dataset was never built and isn't needed; bartowski's
+  imatrix is reused, verified loadable), then the v2 release. Prereg in docs/PREREG_NEMOTRON.md.
+
+# (previous status, 2026-06-10)
 
 v2 is an **additive** upgrade to `scripts/production_mixed_rate_transcoder_gate.py`. Every new flag defaults to v1 behavior; a default run reproduces v1 **byte-for-byte** (proven: smoke parity Δ = 0.00e+00). v1 is pinned at tag `pmra-v1`. Branch: `pmra-objective-upgrade`.
 
