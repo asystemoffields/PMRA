@@ -182,3 +182,23 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   refutation of the coverage hypothesis (as pre-declared). Context, not evidence (cross-run,
   different llama.cpp build): June's 64-probe partial-coverage run scored 2.287 vs the same 2.254
   stock — full coverage with 9 probes and 180MB less matched it. Powered re-run → hopper.
+
+## Corrections (2026-07-03, from the PMRA2 allocation-lens review — verified byte-for-byte in code + artifacts)
+
+A backfill accounting bug (duplicate groups charged to the budget while only the last materializes;
+fixed in cpu_prober.py the same day, guarded by an assertion) contaminates two banked
+interpretations:
+
+1. **cov4:** "backfill exhausted its positive-proxy pool" is FALSE — the tier-1 pool had 286/340
+   proxy-positive pairs. The budget was **phantom-spent**: 44 selection rows, 8 duplicate groups,
+   accounted 450.05MB vs realized 270.40MB → **179.65MB phantom** (reconciles exactly:
+   1928.8 + 270.4 = 2199.2MB measured payload). At the measured band slope (~0.00018–0.0003
+   nats/MB), the missing 180MB explains most of the −0.034 loss. The GRAY-ambiguous verdict
+   stands, but the cause is a now-fixed selection defect, not pool depth.
+2. **Nemotron run1/run3 "parity at 14.5MB smaller payload":** 13.57MB of that deficit is the same
+   phantom (2 duplicate groups). A fixed mix spends those bytes; the "smaller payload" observation
+   (and the hopper's parity-at-fewer-bytes sizing) largely evaporates — the honest statement is
+   parity at ≈equal bytes with the deficit an artifact of the bug.
+
+Also corrected for future sizing: the SE≈0.0023@72-chunks noise floor is Nemotron-specific;
+qwen35's measured paired SE is ~3× larger (0.01189@24 → ≈0.0069@72).

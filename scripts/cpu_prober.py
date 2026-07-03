@@ -978,6 +978,13 @@ def main() -> int:
         )
         backfilled = 0
         for cand in pool:
+            # the pool was materialized before this loop mutates selected_groups,
+            # so the same group can appear at several sources — without this
+            # guard the budget is charged for every duplicate while only the
+            # last one materializes in the GGUF (found 2026-07-03: 179.7MB of
+            # phantom spend on cov4, 13.6MB on nemotron run1/run3)
+            if cand["group"] in selected_groups:
+                continue
             if used + cand["extra_bytes"] > budget_extra:
                 continue
             final_selection.append({
@@ -994,6 +1001,10 @@ def main() -> int:
             used += cand["extra_bytes"]
             backfilled += 1
         print(f"[final] backfill: +{backfilled} proxy-ranked promotions -> {used/1e6:.2f}/{budget_extra/1e6:.2f} MB", flush=True)
+
+    # one GGUF slot per group: duplicate selections mean phantom byte accounting
+    dupe_count = len(final_selection) - len({row["group"] for row in final_selection})
+    assert dupe_count == 0, f"selection contains {dupe_count} duplicate groups (phantom budget spend)"
 
     # Allocation control: 3 seeded random draws; the verdict leg reads the
     # median so one lucky/unlucky draw can't flip GO/GRAY on its own.
