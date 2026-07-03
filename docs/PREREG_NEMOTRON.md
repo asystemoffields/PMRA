@@ -133,3 +133,11 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   rebuildable from result.json + checkpoints if the arm passes). The original "same conditions as
   06-13" framing is void (it died with the kernel); the arm's question is unchanged: does full
   DeltaNet coverage beat stock IQ3_XS within-run where 76.6%-coverage GRAYed.
+- **2026-07-03 run2 (`pmra-nem4b-run2`) ALSO died at the 12h cap (~04:58 UTC), output discarded.**
+  96-chunk evals were too greedy: ~10 finalize evals × ~45–50 min + source re-downloads + the
+  artifact tail (BUILD_ARTIFACT flag didn't exist when run2 was staged). **No verdict was produced,
+  so the single licensed diagnostic re-run remains unconsumed — run3 re-executes the same
+  registered hypothesis, it does not add a new look at data.** run3 design: finalize-only,
+  CHUNKS=72 (3× run1's eval tokens; expected paired SE ≈ 0.0022 ⇒ hypothesized Δ ≈ +0.006 → ~2.7σ;
+  bar unchanged: bank GO iff Δ ≥ 2×SE), BUILD_ARTIFACT=False (run1's artifact is the identical
+  selection), checkpoints carried from run1. Wall-clock budget ≈ 7h ≪ 12h cap.
