@@ -173,3 +173,12 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   hopper): the mix is stock-quality within noise at 14.5MB smaller payload — an equivalence-framed
   "parity at fewer bytes" release would need its own prereg (TOST-style margin) and is not licensed
   by this one.
+- **2026-07-03 cov4 (`pmra-q354b-cov4`, ~8h, COMPLETE): GRAY — AMBIGUOUS per the pre-declared
+  asymmetric rule; arm PARKED.** Mix 2.28839 vs stock iq3_xs 2.25421 (target-leg paired Δ
+  −0.03418±0.01189, −2.88σ — decisive within-run loss); beats random median +0.01942±0.01287
+  (+1.51σ); guardrail pass (+0.01574±0.00441). **Cause visible in the artifact: the 9-probe
+  selection left ~180MB unspent** (mix payload 2199.2MB vs 2379.0MB budget; backfill exhausted its
+  positive-proxy pool at 36 promos/363MB) — the mix ran at ~7.6% fewer bytes than stock. NOT a
+  refutation of the coverage hypothesis (as pre-declared). Context, not evidence (cross-run,
+  different llama.cpp build): June's 64-probe partial-coverage run scored 2.287 vs the same 2.254
+  stock — full coverage with 9 probes and 180MB less matched it. Powered re-run → hopper.
