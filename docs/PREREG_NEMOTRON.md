@@ -154,3 +154,11 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   probes) — a **GO is decisive** (beats stock within-run despite the handicap); a **GRAY is
   AMBIGUOUS** (underpowered selection, NOT a refutation of the coverage hypothesis) → park the
   arm; a properly-powered re-run goes to the hopper.
+- **cov3 VOID (declared at launch+15min, before any result):** Kaggle rejected the cancelled cov2
+  as a kernel source, so cov3 is running WITHOUT the carried checkpoints — its selection will be
+  pure proxy backfill, which is not the registered test. The CLI cannot cancel kernels; cov3's
+  eventual verdict is not binding on any bar (at most an unregistered proxy-only-selection
+  ablation datapoint). **cov4 is the registered continuation:** cov2's recovered checkpoints
+  pushed as private dataset `pmra-q354b-cov2-ckpt` (8KB) and mounted; otherwise identical to
+  cov3's design (finalize-only, 24 chunks, BUILD_ARTIFACT=False, asymmetric interpretation as
+  declared above).
