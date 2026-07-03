@@ -141,3 +141,16 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   CHUNKS=72 (3× run1's eval tokens; expected paired SE ≈ 0.0022 ⇒ hypothesized Δ ≈ +0.006 → ~2.7σ;
   bar unchanged: bank GO iff Δ ≥ 2×SE), BUILD_ARTIFACT=False (run1's artifact is the identical
   selection), checkpoints carried from run1. Wall-clock budget ≈ 7h ≪ 12h cap.
+- **2026-07-03 cov2 (`pmra-q354b-cov2`) died at the 12h cap (~10:10 UTC) — but its CHECKPOINTS
+  SURVIVED** (allocation_rows 9 probes, tier1_scores, scalar_evals, full kernel log). Forensics
+  from the log: **qwen35 evals cost ~25.9 min/probe on Kaggle CPU** (DeltaNet ≈ 2× Nemotron's
+  Mamba2); the 240-min tier-2 budget correctly stopped at 9/24 probes at t≈5.3h; the ~7h finalize
+  then hit the cap. **Abort-rule note (decide-and-document):** the rule's local-135M reproduction
+  cannot reproduce a 4B wall-clock property; the recovered kernel log is the artifact-based
+  reproduction (measured cause: eval speed, not a code fault). **cov3 = finalize-only continuation
+  carrying cov2's checkpoints** (~8.5h ≪ cap; BUILD_ARTIFACT=False; same pinned b9859/corpora so
+  cache signatures validate the carried rows). **Interpretation rule, declared pre-launch:** with
+  only 9 empirical probes + proxy backfill the selection is weaker than the 06-13 run's (64
+  probes) — a **GO is decisive** (beats stock within-run despite the handicap); a **GRAY is
+  AMBIGUOUS** (underpowered selection, NOT a refutation of the coverage hypothesis) → park the
+  arm; a properly-powered re-run goes to the hopper.
