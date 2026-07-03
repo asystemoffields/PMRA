@@ -162,3 +162,14 @@ excluded from the promotion space (V2_STATUS.md 2026-07-02). Hypothesis: full De
   pushed as private dataset `pmra-q354b-cov2-ckpt` (8KB) and mounted; otherwise identical to
   cov3's design (finalize-only, 24 chunks, BUILD_ARTIFACT=False, asymmetric interpretation as
   declared above).
+- **2026-07-03 run3 (`pmra-nem4b-run3`, ~11.4h, COMPLETE): HYPOTHESIS FALSIFIED — GRAY BANKED,
+  NEMOTRON v2 CANDIDATE DOES NOT SHIP.** At 72 chunks (36,864 tokens, 3× run1): target-leg paired
+  Δ = **−0.00349 ± 0.00229 (−1.52σ)** — sign flipped vs run1's +0.00613±0.00378; the implied delta
+  on the added 48 chunks is ≈ −0.008. Random-median leg +0.00031±0.00248 (0.13σ, coin flip). Code
+  guardrail still passes (+0.00537±0.00154). Same selection (32 probes carried, payload 2434.6MB),
+  same pinned b9859, cache signatures enforced. Read: run1's 1.62σ "GO" was prefix noise —
+  amendment 3 (the 2σ banking bar) prevented shipping a mix that is stock-level-or-slightly-worse.
+  Per the registered rule: GRAY banked, stop. Residual honest observation (NOT a bar, goes to the
+  hopper): the mix is stock-quality within noise at 14.5MB smaller payload — an equivalence-framed
+  "parity at fewer bytes" release would need its own prereg (TOST-style margin) and is not licensed
+  by this one.
