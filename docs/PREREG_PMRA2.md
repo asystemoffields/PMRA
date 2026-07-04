@@ -138,3 +138,20 @@ that domain.
   domain-flat at this band; no per-domain allocation headroom. Bank and stop.
 - Hygiene: per-stage json checkpointing, wall-clock guard, working-dir cleanup before exit (the
   kb-1 clutter lesson), pinned b9859.
+- **2026-07-04 Kernel C (`pmra2-kc-1`, ~3.7h, COMPLETE): KILL — the domain-conditional line dies.**
+  Mean KLD(stock IQ3_XS ‖ Q8_0) at 36ch: wiki **0.035243±0.000489**, code **0.014589±0.000461**
+  (0.414× wiki), math **0.013701±0.000327** (0.389×), zh **0.037944±0.000509** (1.077×). All
+  domains ≤1.3× wiki (kill bar); code/math show LESS damage than general text. Quant damage is
+  domain-flat-or-better at this band → no per-domain allocation headroom. Banked.
+
+## Round 2b (registered 2026-07-04, pre-launch): Kernel D — context-length damage curve (`pmra2-kd-1`)
+
+The last distinctive allocation-side mechanism from the roundtable (objective lens P3): hybrid
+`ssm_*` state-update quantization noise may compound through the recurrent state across long
+contexts — invisible at ctx 512, where all prior evals ran; stock ftype rules were tuned at short
+ctx on transformers. Design (Nemotron, ~3h, evals only): same wikitext eval text; per ctx setting,
+Q8_0 reference logits then stock IQ3_XS KLD — ctx 512×36ch / 2048×9ch / 4096×4ch (≈equal tokens).
+- **GO:** damage(4096) ≥ 1.5× damage(512) → design the long-ctx selection arm (probe/select at
+  long ctx; the `ssm_*` groups are already 100% covered by the profile-aware prober).
+- **KILL:** damage(4096) ≤ 1.2× damage(512) → no context-concentrated damage at this band; the
+  final allocation-side candidate closes. Between = park with a scale note.
