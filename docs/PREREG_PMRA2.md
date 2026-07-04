@@ -93,3 +93,15 @@ IQ3_XS with `--kl-divergence` (parse per-chunk KLD + top-1 agreement; raw logs k
 As PREREG_NEMOTRON: push→poll ≤90s, fresh slugs, per-stage checkpoints, 12h-cap-aware wall-clock
 guards, cache signatures (both kernels pin b9859 and record corpus shas). Kernel A carries only
 sig-valid cov2 rows; Kernel B touches no selection at all.
+
+## Run log
+
+- **2026-07-04 Kernel B (`pmra2-kb-1`, ~7.5h, COMPLETE): INSTRUMENT GO; verdict leg confirms the
+  NLL GRAY from the sharper side.** Mean KLD to Q8_0 at 72 chunks: stock IQ3_XS **0.033417 ±
+  0.0003**, parked mix **0.041280 ± 0.000417** — the mix is decisively KLD-worse (+0.0079, ~20σ);
+  top-1 agreement mix 89.341 ± 0.228%. KLD SE ≈ 6–7× sharper than the 0.0023 NLL SE (bar was
+  ≤0.5× → GO): **KLD becomes the standard verdict metric on future arms.** Same-slice NLL legs
+  reproduced run3 across kernels (stock 2.59745, mix 2.60093; Δ −0.00348 vs run3's −0.00349).
+  Consequence for the Nemotron artifact: parked-for-good — stock IQ3_XS is closer to the base
+  model at equal bytes; the equivalence/TOST framing dies too (equivalent on NLL, but measurably
+  less faithful on KLD — an honest card cannot call that parity).
