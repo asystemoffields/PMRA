@@ -155,3 +155,19 @@ Q8_0 reference logits then stock IQ3_XS KLD — ctx 512×36ch / 2048×9ch / 4096
   long ctx; the `ssm_*` groups are already 100% covered by the profile-aware prober).
 - **KILL:** damage(4096) ≤ 1.2× damage(512) → no context-concentrated damage at this band; the
   final allocation-side candidate closes. Between = park with a scale note.
+- **2026-07-04 Kernel D (`pmra2-kd-1`, ~3.6h, COMPLETE): KILL — the final allocation-side
+  mechanism dies.** Mean KLD(stock IQ3_XS ‖ Q8_0) on the same text: ctx512 **0.035243±0.000489**,
+  ctx2048 **0.034501±0.000482** (0.979×), ctx4096 **0.034937±0.000596** (0.991×). Quant damage
+  does NOT compound with context on this Mamba2 hybrid — the ssm state-compounding hypothesis is
+  dead at this band.
+
+## Campaign verdict (2026-07-04)
+
+**Allocation-over-existing-quants cannot beat modern stock anywhere we probed** — mid-band equal
+bytes (both models), gap budgets (better publisher sources exist below), domains (damage
+flat-or-better), context regimes (damage flat). Four pre-registered KILLs, every number verbatim
+above. The campaign's positive residue: the KLD verdict instrument (6–7× sharper), the hardened
+profile-aware prober, the cross-publisher census discipline, and the backfill bugfix. The v2
+identity question — what PMRA2 *is*, given allocation is closed — passes to Alex; the lab's
+recommendation is the **auditor pivot** (hopper: pmra2-as-auditor): verified, error-barred,
+cross-publisher quant audits built on exactly this instrument stack.
