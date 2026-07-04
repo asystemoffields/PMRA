@@ -105,3 +105,36 @@ sig-valid cov2 rows; Kernel B touches no selection at all.
   Consequence for the Nemotron artifact: parked-for-good — stock IQ3_XS is closer to the base
   model at equal bytes; the equivalence/TOST framing dies too (equivalent on NLL, but measurably
   less faithful on KLD — an honest card cannot call that parity).
+- **2026-07-04 Kernel A (`pmra2-ka-1`, ~11.7h, COMPLETE): Q1 KILL — the qwen35 mid-band closes;
+  Q2 killed on evidence in hand (documented deviation).** Q1: fixed-selection full-spend mix
+  (447.3/450.2MB, hessian backfill) vs stock IQ3_XS at 72ch: Δ **−0.00261 ± 0.00515 (−0.51σ)** —
+  statistically indistinguishable; with Nemotron's banked result, "allocation alone cannot beat
+  tuned mid-ladder rungs" now holds on both models at full coverage AND full spend. Postscript
+  confirms the bug post-mortem: cov4's −0.034 → −0.003 after the fix (predicted recovery range
+  [−0.002,+0.019]). Q2: the wall-clock guard dropped the 72ch gap legs, but the 24ch screens
+  decide it — best-below UD-IQ3_XXS 2.28416 / i1-IQ3_XXS 2.29617 vs bartowski iq2_m 2.38722 at
+  ≈equal file size: the below-shelf publishers' quants are ~0.08–0.10 nats better than bartowski's
+  own rungs at those bytes, so a bartowski-source interpolation at 2.03GB (predicted ≈2.36) loses
+  by ~10–15σ. Confirming that with 5.5h of compute serves no decision → **Q2 KILL by measured
+  forecast** (deviation from the 72ch bar, logged here; the naive-blend attribution question is
+  moot with the product dead). Root finding: modern imatrix/dynamic ladders (unsloth UD,
+  mradermacher i1) are better SOURCES, not just tuned ladders — allocation over inferior sources
+  cannot reach them.
+
+## Round 2 (registered 2026-07-04, pre-launch): Kernel C — domain-damage detector (`pmra2-kc-1`)
+
+The one deferred line whose premise survives round 1: stock ladders are tuned/validated on
+general text; if quantization damage concentrates in some domain, per-domain allocation could
+beat stock THERE. Round 1's KLD instrument (6–7× sharper) makes the detector cheap and decisive.
+Design (Nemotron — 2× faster evals than qwen35; one CPU kernel ~6h): 4 corpora (wikitext eval
+slice = baseline; code = existing interleaved MBPP+HumanEval sha ae93382e; math = GSM8K test
+slice; zh = zh-wikipedia slice; each 256KB-recipe, deterministic); per domain: Q8_0 reference
+logits at 36ch then KLD of stock IQ3_XS vs that reference. Damage(domain) = mean KLD(stock‖Q8) on
+that domain.
+- **GO (domain-conditional line lives):** some domain shows damage ≥ 1.5× wiki-damage with
+  non-overlapping ±2SE. Next kernel then measures rank-divergence + a selection arm on the argmax
+  domain.
+- **KILL (line dies, one kernel):** all domains within 1.3× of wiki damage → quant damage is
+  domain-flat at this band; no per-domain allocation headroom. Bank and stop.
+- Hygiene: per-stage json checkpointing, wall-clock guard, working-dir cleanup before exit (the
+  kb-1 clutter lesson), pinned b9859.
