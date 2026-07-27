@@ -73,3 +73,23 @@ v2 is an **additive** upgrade to `scripts/production_mixed_rate_transcoder_gate.
 ## Releases
 - **v1 mixes** (calib-NLL objective) → HF **"PMRA v1" collection** (incl. the in-flight Qwen3.5-4B mix once it lands).
 - **v2 mixes** (KL / held-out objective) → future PMRA v2 collection. Ship only what *clearly* beats stock per-domain.
+
+## 2026-07-27 — v2 DECISION TAKEN: no PMRA v2 (allocation line KILLED by its own campaign)
+
+Alex's portfolio-wide evidence-audit directive resolves the identity question that PMRA2 was
+holding for him. The July campaign measured allocation-over-existing-quants shut on every
+pre-registered axis (verbatim in docs/PREREG_PMRA2.md + PREREG_NEMOTRON.md run logs): mid-band
+equal-bytes KILL on both models (nem −0.0035±0.0023 + KLD-worse ~20σ; qwen35 full-coverage
+−0.0026±0.0052), gap-product KILL (mradermacher-i1 / unsloth-UD are 0.08–0.10 nats better
+SOURCES at equal bytes — the win lives in quantizer quality, not allocation), domain KILL,
+ctx KILL. There is no v2 release: **"v2 mixes" above is dead; ship nothing.** The "Remaining"
+items (A/B code guardrail, Nemotron v2 release path) are struck with it.
+
+What PMRA remains: the **v1 shipped collection** (maintained as-is — most-downloaded work,
+no evidence against the artifacts themselves) and the campaign's residue as house instruments:
+the KLD verdict instrument (6–7× sharper than NLL — portfolio standard now), the profile-aware
+CPU prober, the cross-publisher census discipline, and the backfill phantom-spend bugfix.
+
+The **auditor pivot** (hopper: pmra2-as-auditor) stays exactly where it is — an un-adopted
+idea awaiting Alex's explicit opt-in. It is a NEW product thesis, not an evidence-supported
+continuation of this line, and it should not inherit v2's momentum by default.
